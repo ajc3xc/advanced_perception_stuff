@@ -9,17 +9,25 @@ from launch_ros.substitutions import FindPackageShare
 print('file was updated')
 
 def generate_launch_description():
-    return LaunchDescription([
-            IncludeLaunchDescription
-            (
-                PythonLaunchDescriptionSource([
-                    PathJoinSubstitution([
-                        FindPackageShare('clearpath_gz'), 'launch', 'simulation.launch.py'
-                    ])
-                ]),
-                launch_arguments={
-                    'world': 'orchard',
-                    'rviz': 'true'
-                }.items()
-            )
+    # Dynamically find the path to robot.yaml in the launch folder
+    robot_config_path = PathJoinSubstitution([
+        FindPackageShare('a200_navigation'),
+        'resource',
     ])
+
+    return LaunchDescription([
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource([
+                PathJoinSubstitution([
+                    FindPackageShare('clearpath_gz'),
+                    'launch',
+                    'simulation.launch.py'
+                ])
+            ]),
+            launch_arguments={
+                'world': 'orchard',
+                'rviz': 'true',
+                'setup_path': robot_config_path  # This uses your local config
+            }.items()
+        )
+    ])  
