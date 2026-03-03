@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="fairino10_v6_robot">
+
+  <xacro:include filename="$(find fairino_description)/urdf/fairino10_v6.urdf" />
+
+  <xacro:include filename="$(find fairino10_v6_gazebo)/urdf/fairino10_v6_gazebo.ros2_control.xacro" />
+
+  <xacro:fairino10_v6_gazebo_ros2_control name="GazeboSystem" />
+
+</robot>

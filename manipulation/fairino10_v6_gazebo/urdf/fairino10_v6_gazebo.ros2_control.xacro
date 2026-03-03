@@ -1,0 +1,102 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <xacro:macro name="fairino10_v6_gazebo_ros2_control" params="name">
+
+    <ros2_control name="${name}" type="system">
+
+      <hardware>
+        <plugin>gz_ros2_control/GazeboSimSystem</plugin>
+        <param name = "position_proportional_gain.0">2.0</param>
+      </hardware>
+
+      <joint name="j1">
+        <command_interface name="position">
+          <param name="min">-3.0543</param>
+          <param name="max">3.0543</param>
+        </command_interface>
+        <state_interface name="position">
+          <param name="initial_value">0</param>
+        </state_interface>
+        <state_interface name="velocity">
+          <param name="initial_value">0.0</param>
+        </state_interface>
+      </joint>
+
+      <joint name="j2">
+        <command_interface name="position">
+          <param name="min">-4.6251</param>
+          <param name="max">1.4835</param>
+        </command_interface>
+        <state_interface name="position">
+          <param name="initial_value">0</param>
+        </state_interface>
+        <state_interface name="velocity">
+          <param name="initial_value">0.0</param>
+        </state_interface>
+      </joint>
+
+      <joint name="j3">
+        <command_interface name="position">
+          <param name="min">-2.8274</param>
+          <param name="max">2.8274</param>
+        </command_interface>
+        <state_interface name="position">
+          <param name="initial_value">0</param>
+        </state_interface>
+        <state_interface name="velocity">
+          <param name="initial_value">0.0</param>
+        </state_interface>
+      </joint>
+
+      <joint name="j4">
+        <command_interface name="position">
+          <param name="min">-4.6251</param>
+          <param name="max">1.4835</param>
+        </command_interface>
+        <state_interface name="position">
+          <param name="initial_value">0</param>
+        </state_interface>
+        <state_interface name="velocity">
+          <param name="initial_value">0.0</param>
+        </state_interface>
+      </joint>
+
+      <joint name="j5">
+        <command_interface name="position">
+          <param name="min">-3.0543</param>
+          <param name="max">3.0543</param>
+        </command_interface>
+        <state_interface name="position">
+          <param name="initial_value">0</param>
+        </state_interface>
+        <state_interface name="velocity">
+          <param name="initial_value">0.0</param>
+        </state_interface>
+      </joint>
+
+      <joint name="j6">
+        <command_interface name="position">
+          <param name="min">-3.0543</param>
+          <param name="max">3.0543</param>
+        </command_interface>
+        <state_interface name="position">
+          <param name="initial_value">0.0</param>
+        </state_interface>
+        <state_interface name="velocity">
+          <param name="initial_value">0.0</param>
+        </state_interface>
+      </joint>
+
+    </ros2_control>
+
+    <gazebo>
+      <plugin filename="gz_ros2_control-system"
+              name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+        <parameters>$(find fairino10_v6_gazebo)/config/ros2_controllers.yaml</parameters>
+      </plugin>
+    </gazebo>
+
+  </xacro:macro>
+
+</robot>
