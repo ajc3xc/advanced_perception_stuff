@@ -28,5 +28,15 @@ sam3 = ">=0.1.0.20251211,<0.2"
 
 [pypi-dependencies]
 decord = ">=0.6.0, <0.7"
+opencv-python = ">=4.13.0.92, <5"
+sentencepiece = ">=0.2.1, <0.3"
+imageio = { version = ">=2.37.2, <3", extras = ["pyav"] }
+matplotlib = "*"
+accelerate = ">=1.13.0, <2"
+kernels = ">=0.12.2, <0.13"
+gradio = ">=6.8.0, <7"
+spaces = ">=0.26.0, <0.27"
+numpy = "*"
+peft = ">=0.18.1, <0.19"
 #this may have to change for sam2 vs sam3
 #transformers = ">=4.57.0,<5"

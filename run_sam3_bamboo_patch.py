@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
-from PIL import Image
+from PIL import Image, ImageOps
 
 # --- SAM3 imports (pip-style) ---
 # Your environment shows sam3 imports but lacks sam3.model_builder; this uses the style you requested.
@@ -45,8 +45,8 @@ from sam3.model.sam3_image_processor import Sam3Processor
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 PROMPT = "bamboo stalks"
-DEFAULT_INPUT_DIR = Path("/blue/cli2/a.camerer/ABE6399_Robotics/inputs")
-DEFAULT_OUTPUT_DIR = Path("/blue/cli2/a.camerer/ABE6399_Robotics/outputs")
+DEFAULT_INPUT_DIR = Path("/blue/cli2/a.camerer/ABE6399_Robotics/inputs/images")
+DEFAULT_OUTPUT_DIR = Path("/blue/cli2/a.camerer/ABE6399_Robotics/outputs/images")
 DEFAULT_HF_REPO = "jetjodh/sam3"
 DEFAULT_HF_CKPT = "sam3.pt"
 
@@ -171,17 +171,26 @@ def sam3_predict(processor: Sam3Processor, image: Image.Image) -> Tuple[np.ndarr
         scores = np.zeros((0,), dtype=np.float32)
 
     if torch.is_tensor(masks):
-        masks = masks.detach().cpu().numpy()
+        masks = masks.detach().cpu()
+        if masks.dtype == torch.bfloat16:
+            masks = masks.float()
+        masks = masks.numpy()
     else:
         masks = np.array(masks)
 
     if torch.is_tensor(boxes):
-        boxes = boxes.detach().cpu().numpy()
+        boxes = boxes.detach().cpu()
+        if boxes.dtype == torch.bfloat16:
+            boxes = boxes.float()
+        boxes = boxes.numpy()
     else:
         boxes = np.array(boxes)
 
     if torch.is_tensor(scores):
-        scores = scores.detach().cpu().numpy()
+        scores = scores.detach().cpu()
+        if scores.dtype == torch.bfloat16:
+            scores = scores.float()
+        scores = scores.numpy()
     else:
         scores = np.array(scores)
 
@@ -216,7 +225,7 @@ def process_image(
     min_area: int,
     score_thresh: float,
 ) -> PerImageResult:
-    image = Image.open(img_path).convert("RGB")
+    image = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
     image_np = np.array(image, dtype=np.uint8)
     H, W = image_np.shape[:2]
 
