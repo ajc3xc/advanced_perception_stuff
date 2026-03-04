@@ -31,4 +31,6 @@ qtcreator-*
 COLCON_IGNORE
 AMENT_IGNORE
 
-# End of https://www.toptal.com/developers/gitignore/api/ros2
+# End of https://www.toptal.com/developers/gitignore/api/ros2# pixi environments
+.pixi/*
+!.pixi/config.toml
