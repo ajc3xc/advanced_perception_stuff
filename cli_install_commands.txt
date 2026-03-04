@@ -1,0 +1,14 @@
+# Pixi-first setup for SAM2 via Hugging Face Transformers (no manual checkpoint download).
+# CUDA build target: 12.8 (using cuda-version pin in pixi.toml).
+pixi install
+pixi info
+pixi run python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'gpu', torch.cuda.is_available())"
+
+# Run script:
+pixi run python run_sam2_base.py
+
+# If running offline on HPC after first download:
+# export TRANSFORMERS_OFFLINE=1
+
+# If pixi info does not show __cuda on this node, resolve with override:
+# CONDA_OVERRIDE_CUDA=12.8 pixi install
