@@ -11,7 +11,7 @@ Exports per image:
 Exports dataset:
 - COCO instances JSON (RLE; pycocotools if installed, else uncompressed RLE)
 
-Prompt is fixed to: "bamboo stalks"
+Prompt is fixed to: "bamboo"
 
 Usage:
   python sam3_bamboo_batch.py --input-dir /path/to/images --output-dir /path/to/out --recursive
@@ -44,7 +44,7 @@ from sam3 import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
-PROMPT = "bamboo stalks"
+PROMPT = "bamboo"
 DEFAULT_INPUT_DIR = Path("/blue/cli2/a.camerer/ABE6399_Robotics/inputs/images")
 DEFAULT_OUTPUT_DIR = Path("/blue/cli2/a.camerer/ABE6399_Robotics/outputs/images")
 DEFAULT_HF_REPO = "jetjodh/sam3"

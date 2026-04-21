@@ -38,6 +38,5 @@ gradio = { version = ">=6.8.0, <7", extras = ["mcp"] }
 spaces = ">=0.26.0, <0.27"
 numpy = "*"
 peft = ">=0.18.1, <0.19"
-torch = "*"
 #this may have to change for sam2 vs sam3
 #transformers = ">=4.57.0,<5"

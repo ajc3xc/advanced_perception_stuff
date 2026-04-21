@@ -21,7 +21,7 @@ from sam3.model.sam3_image_processor import Sam3Processor
 INPUT_DIR = Path("/blue/cli2/a.camerer/ABE6399_Robotics/inputs")
 OUTPUT_DIR = Path("/blue/cli2/a.camerer/ABE6399_Robotics/outputs")
 
-PROMPT = "bamboo stalks"
+PROMPT = "bamboo"
 HF_REPO = "jetjodh/sam3"
 HF_CKPT = "sam3.pt"
 

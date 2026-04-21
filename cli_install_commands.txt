@@ -12,3 +12,8 @@ pixi run python run_sam2_base.py
 
 # If pixi info does not show __cuda on this node, resolve with override:
 # CONDA_OVERRIDE_CUDA=12.8 pixi install
+
+
+
+run app:
+SAM3_MODEL_REPO=jetjodh/sam3 pixi run python app.py

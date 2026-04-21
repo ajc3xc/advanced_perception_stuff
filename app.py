@@ -81,6 +81,8 @@ app_theme = CustomBlueTheme()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_REPO = os.environ.get("SAM3_MODEL_REPO", "jetjodh/sam3")
+DEFAULT_IMAGE_PROMPT = os.environ.get("SAM3_DEFAULT_IMAGE_PROMPT", "bamboo")
+DEFAULT_VIDEO_PROMPT = os.environ.get("SAM3_DEFAULT_VIDEO_PROMPT", "bamboo")
 print(f"🖥️ Using compute device: {device}")
 print(f"📦 Using SAM3 repo: {MODEL_REPO}")
 
@@ -180,8 +182,9 @@ def run_image_segmentation(source_img, text_query, conf_thresh=0.5):
     if IMG_MODEL is None or IMG_PROCESSOR is None:
         raise gr.Error("Models failed to load on startup.")
         
-    if source_img is None or not text_query:
-        raise gr.Error("Please provide an image and a text prompt.")
+    if source_img is None:
+        raise gr.Error("Please provide an image.")
+    text_query = _normalize_prompt(text_query, DEFAULT_IMAGE_PROMPT)
     
     try:
         pil_image = source_img.convert("RGB")
@@ -257,13 +260,22 @@ def image_click_handler(image, evt: gr.SelectData, points_state, labels_state):
 def calc_timeout_duration(vid_file, *args):
     return args[-1] if args else 60
 
+
+def _normalize_prompt(text_query: str | None, default_prompt: str) -> str:
+    if text_query is None:
+        return default_prompt
+    normalized = str(text_query).strip()
+    return normalized if normalized else default_prompt
+
+
 @spaces.GPU(duration=calc_timeout_duration)
 def run_video_segmentation(source_vid, text_query, frame_limit, time_limit):
     if VID_MODEL is None or VID_PROCESSOR is None:
         raise gr.Error("Video Models failed to load on startup.")
 
-    if not source_vid or not text_query:
-        raise gr.Error("Missing video or prompt.")
+    if not source_vid:
+        raise gr.Error("Missing video.")
+    text_query = _normalize_prompt(text_query, DEFAULT_VIDEO_PROMPT)
         
     try:
         video_cap = cv2.VideoCapture(source_vid)
@@ -321,7 +333,11 @@ with gr.Blocks() as demo:
                 with gr.Row():
                     with gr.Column(scale=1):
                         image_input = gr.Image(label="Upload Image", type="pil", height=350)
-                        txt_prompt_img = gr.Textbox(label="Text Prompt", placeholder="e.g., cat, face, car wheel")
+                        txt_prompt_img = gr.Textbox(
+                            label="Text Prompt",
+                            value=DEFAULT_IMAGE_PROMPT,
+                            placeholder="e.g., cat, face, car wheel",
+                        )
                         with gr.Accordion("Advanced Settings", open=False):
                             conf_slider = gr.Slider(0.0, 1.0, value=0.45, step=0.05, label="Confidence Threshold")
                         
@@ -351,7 +367,11 @@ with gr.Blocks() as demo:
                 with gr.Row():
                     with gr.Column():
                         video_input = gr.Video(label="Upload Video", format="mp4", height=320)
-                        txt_prompt_vid = gr.Textbox(label="Text Prompt", placeholder="e.g., person running, red car")
+                        txt_prompt_vid = gr.Textbox(
+                            label="Text Prompt",
+                            value=DEFAULT_VIDEO_PROMPT,
+                            placeholder="e.g., person running, red car",
+                        )
                         
                         with gr.Row():
                             frame_limiter = gr.Slider(10, 500, value=60, step=10, label="Max Frames")

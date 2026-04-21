@@ -1,0 +1,28 @@
+[workspace]
+authors = ["Adam Camerer <ajc3xc@umsystem.edu>"]
+channels = ["pytorch", "nvidia", "conda-forge"]
+channel-priority = "disabled"
+name = "groundedsam_v2"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[system-requirements]
+cuda = "12.8"
+
+[pypi-options]
+no-build-isolation = ["flash-attn"]
+
+[tasks]
+
+[dependencies]
+python = "3.10.*"
+pip = ">=24,<27"
+pytorch-gpu = ">=2.4,<3"
+torchvision = ">=0.19,<1"
+cuda-version = "12.8.*"
+
+[pypi-dependencies]
+autodistill-grounded-sam-2 = "*"
+autodistill-yolov8 = "*"
+scikit-learn = ">=1.7.2, <2"
+transformers = ">=4.45,<4.50"
