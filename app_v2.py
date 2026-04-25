@@ -15,8 +15,12 @@ except Exception:
     class _SpacesDummy:  # noqa: N801
         @staticmethod
         def GPU(*args, **kwargs):
+            if args and callable(args[0]) and len(args) == 1 and not kwargs:
+                return args[0]
+
             def deco(fn):
                 return fn
+
             return deco
     spaces = _SpacesDummy()
 
@@ -650,7 +654,7 @@ with gr.Blocks() as demo:
                             conf_slider = gr.Slider(0.0, 1.0, value=0.45, step=0.05, label="Confidence Threshold")
                         btn_process_img = gr.Button("Segment Image", variant="primary")
 
-                    with gr.Column(scale=1.5):
+                    with gr.Column(scale=3):
                         image_result = gr.AnnotatedImage(label="Segmented Result", height=410)
 
                         gr.Examples(
@@ -801,7 +805,7 @@ with gr.Blocks() as demo:
                         me_btn_save = gr.Button("Save Mask", variant="primary")
                         me_status = gr.Textbox(label="Status", interactive=False)
 
-                    with gr.Column(scale=1.2):
+                    with gr.Column(scale=6):
                         me_overlay = gr.Image(type="pil", label="Overlay Preview", height=520, interactive=True)
                         me_mask_bw = gr.Image(type="pil", label="Mask (B/W preview)", height=260, interactive=False)
 
@@ -910,7 +914,7 @@ This is the “one button” batch step for a prompt like **bamboo**.
                         bf_save_overlays = gr.Checkbox(value=True, label="Save overlay PNGs")
                         bf_btn = gr.Button("Run Batch Folder", variant="primary")
 
-                    with gr.Column(scale=1.2):
+                    with gr.Column(scale=6):
                         bf_log = gr.Textbox(label="Batch Log (tail)", lines=22, interactive=False)
 
                 bf_btn.click(

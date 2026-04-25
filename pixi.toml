@@ -2,7 +2,7 @@
 channels = ["pytorch", "nvidia", "conda-forge"]
 channel-priority = "disabled"
 name = "advanced_robotic_systems"
-platforms = ["linux-64"]
+platforms = ["win-64"]
 version = "0.1.0"
 
 [system-requirements]

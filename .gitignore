@@ -35,3 +35,6 @@ AMENT_IGNORE
 # End of https://www.toptal.com/developers/gitignore/api/ros2# pixi environments
 .pixi/*
 !.pixi/config.toml
+
+pixi_backups/
+*.exe
