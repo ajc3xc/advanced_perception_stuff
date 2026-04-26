@@ -27,6 +27,7 @@ qtcreator-*
 .#*
 
 .vscode/
+*.log
 
 # Colcon custom files
 COLCON_IGNORE

@@ -4,9 +4,14 @@ import cv2
 import json
 import time
 import tempfile
+import psutil, os as _os
 from pathlib import Path
 from datetime import datetime
 from typing import Iterable
+
+def _mem():
+    p = psutil.Process(_os.getpid())
+    return f"RAM={p.memory_info().rss/1e9:.2f}GB"
 
 # --- spaces (HF) optional fallback for local runs ---
 try:
@@ -119,16 +124,29 @@ print("⏳ Loading SAM3 Models permanently into memory...")
 
 try:
     print("   ... Loading Image Text Model")
-    IMG_MODEL = Sam3Model.from_pretrained(MODEL_REPO).to(device)
+    IMG_MODEL = Sam3Model.from_pretrained(
+        MODEL_REPO,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+    ).to(device)
     IMG_PROCESSOR = Sam3Processor.from_pretrained(MODEL_REPO)
 
     print("   ... Loading Image Tracker Model")
-    TRK_MODEL = Sam3TrackerModel.from_pretrained(MODEL_REPO).to(device)
+    TRK_MODEL = Sam3TrackerModel.from_pretrained(
+        MODEL_REPO,
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True,
+    ).to(device)
     TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(MODEL_REPO)
 
     print("   ... Loading Video Model")
-    VID_MODEL = Sam3VideoModel.from_pretrained(MODEL_REPO).to(device, dtype=torch.bfloat16)
+    VID_MODEL = Sam3VideoModel.from_pretrained(
+        MODEL_REPO,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+    ).to(device)
     VID_PROCESSOR = Sam3VideoProcessor.from_pretrained(MODEL_REPO)
+    print(f"[model_load_complete] {_mem()}")
 
     print("✅ All Models loaded successfully!")
 except Exception as e:
@@ -136,6 +154,63 @@ except Exception as e:
     IMG_MODEL = IMG_PROCESSOR = None
     TRK_MODEL = TRK_PROCESSOR = None
     VID_MODEL = VID_PROCESSOR = None
+
+def _print_model_device_report():
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    print("\n" + "=" * 60)
+    print("MODEL DEVICE REPORT")
+    print("=" * 60)
+
+    models = {
+        "IMG_MODEL": IMG_MODEL,
+        "TRK_MODEL": TRK_MODEL,
+        "VID_MODEL": VID_MODEL,
+    }
+
+    for name, model in models.items():
+        if model is None:
+            print(f"  {name}: NOT LOADED")
+            continue
+
+        try:
+            first_param = next(model.parameters())
+            device_loc = first_param.device
+            dtype = first_param.dtype
+        except StopIteration:
+            device_loc = "unknown"
+            dtype = "unknown"
+
+        total_bytes = sum(
+            param.numel() * param.element_size()
+            for param in model.parameters()
+        )
+        total_mb = total_bytes / 1e6
+
+        print(f"  {name}: device={device_loc}, dtype={dtype}, size={total_mb:.1f} MB")
+
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            alloc = torch.cuda.memory_allocated(i) / 1e9
+            reserved = torch.cuda.memory_reserved(i) / 1e9
+            total = torch.cuda.get_device_properties(i).total_memory / 1e9
+            print(
+                f"  GPU {i} ({torch.cuda.get_device_name(i)}): "
+                f"allocated={alloc:.2f}GB, reserved={reserved:.2f}GB, total={total:.2f}GB"
+            )
+    else:
+        print("  CUDA not available - all models are on CPU")
+
+    process = psutil.Process(_os.getpid())
+    print(f"  System RAM used by process: {process.memory_info().rss / 1e9:.2f} GB")
+    print("=" * 60 + "\n")
+
+
+_print_model_device_report()
 
 # ---------------- UTILS ----------------
 def apply_mask_overlay(base_image, mask_data, opacity=0.5):
@@ -247,6 +322,7 @@ def _normalize_prompt(text_query: str | None, default_prompt: str) -> str:
 @spaces.GPU
 def run_image_segmentation(source_img, text_query, conf_thresh=0.5):
     """Original annotated-image demo (unchanged)."""
+    print(f"[run_image_segmentation] START {_mem()}")
     if IMG_MODEL is None or IMG_PROCESSOR is None:
         raise gr.Error("Models failed to load on startup.")
     if source_img is None:
@@ -285,6 +361,7 @@ def run_image_segmentation(source_img, text_query, conf_thresh=0.5):
 @spaces.GPU
 def run_image_prompt_semantic(source_img, text_query, conf_thresh=0.5):
     """Prompt -> semantic union mask + overlay preview."""
+    print(f"[run_image_prompt_semantic] START {_mem()}")
     if IMG_MODEL is None or IMG_PROCESSOR is None:
         raise gr.Error("Models failed to load on startup.")
     if source_img is None:
@@ -315,6 +392,7 @@ def run_image_prompt_semantic(source_img, text_query, conf_thresh=0.5):
 @spaces.GPU
 def tracker_single_click_mask(image_pil: Image.Image, x: int, y: int):
     """Return best tracker mask for a single positive click."""
+    print(f"[tracker_single_click_mask] START {_mem()}")
     if TRK_MODEL is None or TRK_PROCESSOR is None:
         raise gr.Error("Tracker Model failed to load.")
     if image_pil is None:
@@ -377,6 +455,7 @@ def _push_history(hist, mask, pts, modes):
     return hist
 
 def mask_editor_auto(source_img, prompt, conf, st_hist, st_pts, st_modes):
+    print(f"[mask_editor_auto] START {_mem()}")
     pil, sem, overlay = run_image_prompt_semantic(source_img, prompt, conf)
     st_hist = []
     st_pts = []
@@ -527,6 +606,7 @@ def run_video_segmentation(source_vid, text_query, frame_limit, time_limit):
 # ---------------- BATCH FOLDER TAB ----------------
 @spaces.GPU
 def batch_folder_prompt_run(in_dir, out_dir, prompt, conf, recursive, overwrite, save_overlays, progress=gr.Progress()):
+    print(f"[batch_folder_prompt_run] START {_mem()}")
     if IMG_MODEL is None or IMG_PROCESSOR is None:
         raise gr.Error("Models failed to load on startup.")
 
@@ -618,6 +698,21 @@ def batch_folder_prompt_run(in_dir, out_dir, prompt, conf, recursive, overwrite,
 custom_css = """
 #col-container { margin: 0 auto; max-width: 1100px; }
 #main-title h1 { font-size: 2.1em !important; }
+
+/* Fix tab nav click-through bug on Windows (stacking context from theme shadows) */
+.tabs > .tab-nav {
+    position: relative !important;
+    z-index: 20 !important;
+}
+.tabs > .tab-nav button {
+    pointer-events: auto !important;
+    position: relative !important;
+    z-index: 20 !important;
+}
+.tabitem {
+    position: relative !important;
+    z-index: 1 !important;
+}
 """
 
 CTRLZ_JS = r"""
@@ -639,7 +734,7 @@ with gr.Blocks() as demo:
         gr.Markdown("# **SAM3: Segment Anything Model 3**", elem_id="main-title")
         gr.Markdown("Segment objects in image or video using **SAM3** with Text Prompts or Interactive Clicks.")
 
-        with gr.Tabs():
+    with gr.Tabs():
             # -------- Original tabs (kept) --------
             with gr.Tab("Image Segmentation"):
                 with gr.Row():
@@ -924,4 +1019,11 @@ This is the “one button” batch step for a prompt like **bamboo**.
                 )
 
 if __name__ == "__main__":
-    demo.launch(css=custom_css, theme=app_theme, ssr_mode=False, mcp_server=False, show_error=True)
+    demo.launch(
+        css=custom_css,
+        theme=app_theme,
+        ssr_mode=False,
+        mcp_server=False,
+        show_error=True,
+        max_threads=2,
+    )
