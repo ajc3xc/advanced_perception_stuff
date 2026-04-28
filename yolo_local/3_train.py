@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-_3_train.py — Train YOLO11m-seg on the bamboo dataset.
+3_train.py — Train YOLO11m-seg on the bamboo dataset.
+Tuned for RTX 3080 (10GB stock / 20GB modded) on Windows.
 
 Run with:
-    nohup pixi run python _3_train.py > train.log 2>&1 &
-    tail -f train.log
+    pixi run python 3_train.py
 """
 
 import matplotlib
-matplotlib.use('Agg')  # MUST be before ultralytics import — fixes silent crash on headless nodes
+matplotlib.use('Agg')  # MUST be before ultralytics import
 
 import sys
 import time
@@ -26,11 +26,17 @@ YAML_PATH = YOLO_ROOT / "bamboo.yaml"
 RUN_NAME  = "bamboo_seg_v1"
 DEVICE    = 0
 
-if not YAML_PATH.exists():
-    raise FileNotFoundError(f"Dataset YAML not found: {YAML_PATH}\nRun _2_convert_masks.py first.")
+# ── 3080 VRAM settings ────────────────────────────────────────────────────────
+# 10GB stock:  BATCH=8   IMGSZ=640
+# 20GB modded: BATCH=16  IMGSZ=640  (or BATCH=4 IMGSZ=1280)
+IMGSZ = 640
+BATCH = 8
 
-# ── heartbeat: prints every 60s so tail -f train.log shows it's alive ─────────
-def _heartbeat():
+if not YAML_PATH.exists():
+    raise FileNotFoundError(f"Dataset YAML not found: {YAML_PATH}\nRun 2_convert_masks.py first.")
+
+# ── heartbeat ─────────────────────────────────────────────────────────────────
+'''def _heartbeat():
     i = 0
     while True:
         time.sleep(60)
@@ -38,33 +44,45 @@ def _heartbeat():
         print(f"[heartbeat] still running — {i} min elapsed", flush=True)
 
 threading.Thread(target=_heartbeat, daemon=True).start()
-
-# ── launch tensorboard in background on port 6007 ─────────────────────────────
+'''
+# ── tensorboard ───────────────────────────────────────────────────────────────
 try:
     tb = subprocess.Popen(
-        ["tensorboard", "--logdir", str(RUNS_DIR), "--port", "6007",
-         "--host", "0.0.0.0", "--reload_interval", "10"],
+        ["tensorboard", "--logdir", str(RUNS_DIR), "--port", "6006",
+         "--host", "127.0.0.1", "--reload_interval", "10"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    print(f"[tensorboard] PID={tb.pid}  →  forward port 6007 in VS Code Ports tab", flush=True)
+    print(f"[tensorboard] PID={tb.pid}  ->  http://localhost:6006", flush=True)
 except Exception as e:
-    print(f"[tensorboard] could not start: {e} — training continues anyway", flush=True)
+    print(f"[tensorboard] not available: {e} — continuing anyway", flush=True)
 
-# ── train ──────────────────────────────────────────────────────────────────────
+# ── train ─────────────────────────────────────────────────────────────────────
 try:
-    from ultralytics import YOLO
+    import torch
+    print(f"[cuda] available={torch.cuda.is_available()}", flush=True)
+    if torch.cuda.is_available():
+        print(f"[cuda] device={torch.cuda.get_device_name(0)}", flush=True)
+        print(f"[cuda] vram={torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB", flush=True)
+    else:
+        print("[cuda] WARNING: no CUDA — will train on CPU (very slow)", flush=True)
 
-    print(f"[train] starting — output → {RUNS_DIR / RUN_NAME}", flush=True)
-    model   = YOLO("yolo11m-seg.pt")
+    from ultralytics import YOLO
+    print(f"[train] imgsz={IMGSZ}  batch={BATCH}  device={DEVICE}", flush=True)
+    print(f"[train] output -> {RUNS_DIR / RUN_NAME}", flush=True)
+    print(f"[train] loading yolo11m-seg.pt ...", flush=True)
+
+    model = YOLO("yolo11m-seg.pt")
+    print(f"[train] model loaded — starting training loop ...", flush=True)
+
     results = model.train(
-        data    = str(YAML_PATH),
+        data    = YAML_PATH.as_posix(),
         project = str(RUNS_DIR),
         name    = RUN_NAME,
 
-        imgsz   = 1280,
-        batch   = 64,
-        cache   = "disk",
-        workers = 8,
+        imgsz   = IMGSZ,
+        batch   = BATCH,
+        cache   = False,
+        workers = 0,
 
         epochs        = 100,
         patience      = 20,
@@ -75,14 +93,14 @@ try:
         amp           = True,
 
         mosaic     = 1.0,
-        copy_paste = 0.3,
         fliplr     = 0.5,
-        flipud     = 0.0,
-        degrees    = 5.0,
         scale      = 0.5,
-        hsv_h      = 0.02,
         hsv_s      = 0.5,
         hsv_v      = 0.4,
+        flipud     = 0.0,
+        copy_paste = 0.0,
+        degrees    = 0.0,
+        hsv_h      = 0.0,
 
         device   = DEVICE,
         save     = True,
@@ -93,7 +111,7 @@ try:
 
     best = Path(results.save_dir) / "weights" / "best.pt"
     if not best.exists():
-        print(f"\n❌ ERROR: training finished but best.pt missing at {best}", flush=True)
+        print(f"\n❌ best.pt missing at {best}", flush=True)
         sys.exit(1)
 
     print(f"\n✅ Training complete", flush=True)
@@ -101,7 +119,7 @@ try:
     print(f"   Results dir  : {results.save_dir}", flush=True)
 
 except KeyboardInterrupt:
-    print("\n⚠️  Interrupted by user.", flush=True)
+    print("\n⚠️  Interrupted.", flush=True)
     sys.exit(1)
 except Exception:
     import traceback

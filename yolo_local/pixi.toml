@@ -15,7 +15,7 @@ infer  = "python 4_infer.py"
 [dependencies]
 python       = "3.12.*"
 pip          = ">=26,<27"
-pytorch-gpu  = "*"
+#pytorch-gpu  = "*"
 torchvision  = ">=0.22,<1"
 cuda-version = "12.8.*"
 numpy = ">=2.4.3,<3"
@@ -29,3 +29,5 @@ py-opencv = "*"
 #opencv-python = ">=4.10,<5"
 #numpy         = "*"
 #matplotlib    = "*"
+torch        = { version = ">=2.7,<3", index = "https://download.pytorch.org/whl/cu128" }
+torchvision  = { version = ">=0.22,<1", index = "https://download.pytorch.org/whl/cu128" }

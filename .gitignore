@@ -20,8 +20,10 @@ srv/_*.py
 *.pyc
 qtcreator-*
 *.user
-
+synthetic_data/
 *~
+*.gitignore
+*.pt
 
 # Emacs
 .#*

@@ -120,8 +120,10 @@ def main():
         if written % 100 == 0:
             print(f"  {written}/{len(pairs)} ...", flush=True)
 
+    # ── write YAML with forward slashes — YOLO breaks on Windows backslashes ──
+    yolo_root_str = YOLO_ROOT.as_posix()
     yaml = (
-        f"path: {YOLO_ROOT}\n"
+        f"path: {yolo_root_str}\n"
         f"train: images/train\n"
         f"val:   images/val\n\n"
         f"nc: 1\n"
