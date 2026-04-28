@@ -37,6 +37,8 @@ peft            = ">=0.18.1,<0.19"
 transformers    = "*"
 ffmpeg          = ">=7.0,<8"
 pytz = ">=2026.1.post1,<2027"
+scikit-image = ">=0.26.0,<0.27"
+scikit-learn = ">=1.8.0,<2"
 
 [pypi-dependencies]
 # decord — no win-64 conda build exists
