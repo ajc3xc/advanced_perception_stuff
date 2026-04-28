@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""
+3b_train_roboflow.py — Configure augmentations and kick off training on Roboflow.
+
+Run after _3_upload_to_roboflow.py has finished uploading.
+"""
+
+from roboflow import Roboflow
+
+# ── EDIT THESE ────────────────────────────────────────────────────────────────
+ROBOFLOW_API_KEY = "YOUR_API_KEY_HERE"
+WORKSPACE        = "xiaoyus-workspace-wtaot"
+PROJECT          = "bamboo_synthetic"
+MODEL_VERSION    = 1   # bump this if you've already trained v1
+# ─────────────────────────────────────────────────────────────────────────────
+
+rf      = Roboflow(api_key=ROBOFLOW_API_KEY)
+project = rf.workspace(WORKSPACE).project(PROJECT)
+
+# ── generate a new dataset version with augmentations ────────────────────────
+print("Generating dataset version with augmentations …")
+version = project.generate_version(settings={
+    "augmentation": {
+        "flip":         {"enabled": True, "horizontal": True, "vertical": False},
+        "rotation":     {"enabled": True, "degrees": 15},
+        "brightness":   {"enabled": True, "percent": 15},
+        "exposure":     {"enabled": True, "percent": 10},
+        "blur":         {"enabled": True, "pixels": 2},
+        "noise":        {"enabled": True, "percent": 0.1},
+        "saturation":   {"enabled": True, "percent": 25},
+        "hue":          {"enabled": True, "degrees": 15},
+        "crop":         {"enabled": True, "min": 0, "max": 20},
+        "mosaic":       {"enabled": True},
+        # explicitly off
+        "ninety_rotate":  {"enabled": False},
+        "grayscale":      {"enabled": False},
+        "cutout":         {"enabled": False},
+    },
+    "preprocessing": {
+        "resize": {"enabled": True, "width": 1280, "height": 720, "format": "Stretch to"},
+    }
+})
+
+print(f"✅ Version generated: {version}")
+
+# ── kick off training ─────────────────────────────────────────────────────────
+print("Starting training …")
+version.train(speed="fast")
+print("✅ Training started — check app.roboflow.com for progress")

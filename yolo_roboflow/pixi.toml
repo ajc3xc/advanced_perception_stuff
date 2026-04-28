@@ -1,0 +1,27 @@
+[workspace]
+channels = ["conda-forge"]
+channel-priority = "disabled"
+name = "advanced_robotic_systems"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+gen-test-data  = "python _0_gen_data.py"
+extract-frames = "python _1_extract_frames.py"
+convert-masks  = "python _2_convert_masks.py"
+upload         = "python _3_upload_to_roboflow.py"
+infer          = "python _4_infer_roboflow.py"
+check          = "python _5_check.py results"
+pipeline-test  = { depends-on = ["gen-test-data", "convert-masks", "upload"] }
+
+[dependencies]
+python   = "3.12.*"
+pip      = ">=26.0.1,<27"
+pillow   = ">=11.3.0,<13"
+numpy    = "*"
+ffmpeg   = ">=7.0,<8"
+
+[pypi-dependencies]
+opencv-python = ">=4.13.0.92,<5"
+roboflow      = ">=1.1.0,<2"
+matplotlib    = "*"
