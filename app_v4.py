@@ -304,6 +304,23 @@ try:
 except Exception as e:
     print(f"❌  VID_PREDICTOR load failed: {e}")
 
+# ── Blanket BFloat16 fix: hook every Conv2d in the video predictor ─────────────
+# The SAM3 backbone runs in BFloat16 but many conv weight/bias tensors stay
+# float32 on Windows (no Triton autocast kernel). Rather than patching each
+# file individually we register a single forward pre-hook on every Conv2d
+# layer that silently casts the input to match the weight dtype.
+if VID_PREDICTOR is not None:
+    def _conv_dtype_hook(module, args):
+        x = args[0]
+        if isinstance(x, torch.Tensor) and x.dtype != module.weight.dtype:
+            return (x.to(module.weight.dtype),) + args[1:]
+    _n_hooks = sum(
+        1 for _m in VID_PREDICTOR.model.modules()
+        if isinstance(_m, torch.nn.Conv2d)
+        and not _m.register_forward_pre_hook(_conv_dtype_hook)
+    )
+    print(f"[dtype-hooks] Conv2d input-cast hooks registered on VID_PREDICTOR")
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SHARED UTILS  (model-agnostic, identical to v3)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -409,6 +426,9 @@ def _parse_native_outputs(outputs, vid_h: int, vid_w: int):
     Parse native SAM3 handle_request outputs into a list of (obj_id, mask_np) tuples.
     outputs is the response["outputs"] dict from add_prompt or propagate.
     Returns list of (obj_id: int, binary_mask: np.ndarray HxW uint8).
+
+    prepare_masks_for_visualization returns {frame_idx: {obj_id: binary_mask_ndarray}}
+    so obj_data IS the mask directly, not a dict wrapping it.
     """
     results = []
     if outputs is None:
@@ -416,8 +436,7 @@ def _parse_native_outputs(outputs, vid_h: int, vid_w: int):
     try:
         fmt = prepare_masks_for_visualization({0: outputs})
         frame_out = fmt.get(0, {})
-        for obj_id, obj_data in frame_out.items():
-            mask = obj_data.get("mask", None)
+        for obj_id, mask in frame_out.items():
             if mask is None:
                 continue
             if isinstance(mask, torch.Tensor):
@@ -616,6 +635,16 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
     if VID_PREDICTOR is None:
         return None, None, [], None, 0, "❌ VID_PREDICTOR not loaded.", 0.0, 0, 0
 
+    # Wire the UI confidence slider into the native predictor's detection thresholds.
+    # The model defaults are score_threshold_detection=0.5, new_det_thresh=0.7 which
+    # are too strict for real-world footage. Apply the user's conf value here.
+    try:
+        VID_PREDICTOR.model.score_threshold_detection = float(conf)
+        VID_PREDICTOR.model.new_det_thresh = float(conf)
+        print(f"[vid_start_session] detection thresholds → {conf:.2f}")
+    except Exception as _e:
+        print(f"[vid_start_session] could not set detection thresholds: {_e}")
+
     # ── read video metadata + frame 0 only ───────────────────────────────
     cap     = cv2.VideoCapture(video_path_str)
     fps     = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -713,6 +742,14 @@ def vid_expand_session_for_propagation(
     list of np.ndarray RGB frames.
     """
     print(f"[vid_expand_session] START  {_mem()}")
+
+    # Re-apply detection thresholds (they may have been changed since session start)
+    try:
+        VID_PREDICTOR.model.score_threshold_detection = float(
+            getattr(VID_PREDICTOR.model, "score_threshold_detection", 0.5)
+        )
+    except Exception:
+        pass
 
     # ── extract all frames ────────────────────────────────────────────────
     cap     = cv2.VideoCapture(video_path_str)
