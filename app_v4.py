@@ -424,30 +424,51 @@ def union_instance_masks(results) -> np.ndarray | None:
 def _parse_native_outputs(outputs, vid_h: int, vid_w: int):
     """
     Parse native SAM3 handle_request outputs into a list of (obj_id, mask_np) tuples.
-    outputs is the response["outputs"] dict from add_prompt or propagate.
-    Returns list of (obj_id: int, binary_mask: np.ndarray HxW uint8).
-
-    prepare_masks_for_visualization returns {frame_idx: {obj_id: binary_mask_ndarray}}
-    so obj_data IS the mask directly, not a dict wrapping it.
+    Handles three possible output formats:
+      A) {"out_obj_ids": ndarray, "out_binary_masks": ndarray, ...}  — text PCS format
+      B) {obj_id (int): mask_tensor}                                  — point/build_outputs format
+      C) prepare_masks_for_visualization already processed result     — {obj_id: binary_mask}
     """
     results = []
     if outputs is None:
         return results
+
+    def _add(obj_id, mask):
+        if mask is None: return
+        if isinstance(mask, torch.Tensor): mask = mask.detach().cpu().numpy()
+        mask = np.asarray(mask).squeeze()
+        if mask.ndim != 2: return
+        if not mask.any(): return
+        if mask.shape != (vid_h, vid_w):
+            mask = np.array(Image.fromarray(mask.astype(np.uint8)).resize(
+                (vid_w, vid_h), Image.NEAREST))
+        results.append((int(obj_id), (mask > 0).astype(np.uint8)))
+
     try:
+        # ── Format A: text PCS output with named keys ─────────────────
+        if isinstance(outputs, dict) and "out_obj_ids" in outputs:
+            ids   = outputs["out_obj_ids"]
+            masks = outputs["out_binary_masks"]
+            ids_list = ids.tolist() if hasattr(ids, "tolist") else list(ids)
+            for i, obj_id in enumerate(ids_list):
+                _add(obj_id, masks[i])
+            if results:
+                return results
+
+        # ── Format B: integer-keyed dict {obj_id: mask_tensor} ────────
+        if isinstance(outputs, dict) and outputs and all(
+            isinstance(k, (int, np.integer)) for k in outputs.keys()
+        ):
+            for obj_id, mask in outputs.items():
+                _add(obj_id, mask)
+            if results:
+                return results
+
+        # ── Format C: prepare_masks_for_visualization path ────────────
         fmt = prepare_masks_for_visualization({0: outputs})
-        frame_out = fmt.get(0, {})
-        for obj_id, mask in frame_out.items():
-            if mask is None:
-                continue
-            if isinstance(mask, torch.Tensor):
-                mask = mask.detach().cpu().numpy()
-            mask = np.asarray(mask).squeeze()
-            if mask.ndim != 2:
-                continue
-            if mask.shape != (vid_h, vid_w):
-                mask = np.array(Image.fromarray(mask.astype(np.uint8)).resize(
-                    (vid_w, vid_h), Image.NEAREST))
-            results.append((int(obj_id), (mask > 0).astype(np.uint8)))
+        for obj_id, mask in fmt.get(0, {}).items():
+            _add(obj_id, mask)
+
     except Exception as e:
         print(f"[_parse_native_outputs] failed: {e}")
     return results
@@ -714,10 +735,11 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
         import traceback; traceback.print_exc()
         status     = f"⚠️ Session started but PCS failed: {e}"
         overlay    = Image.fromarray(frame0_rgb)
+        obj_masks  = []
         n_obj      = 0
 
     # frames list holds only frame 0 for now; propagation will repopulate it
-    return session_id, temp_dir, [frame0_rgb], overlay, n_obj, status, out_fps, vid_h, vid_w
+    return session_id, temp_dir, [frame0_rgb], overlay, obj_masks, n_obj, status, out_fps, vid_h, vid_w
 
 
 def vid_expand_session_for_propagation(
@@ -1321,8 +1343,8 @@ with gr.Blocks() as demo:
                     me_prompt = gr.Textbox(label="Prompt", value=DEFAULT_PROMPT)
                     me_conf   = gr.Slider(0.0, 1.0, value=0.45, step=0.05,
                                           label="Confidence Threshold")
-                    me_mode   = gr.Radio(["add", "refine", "erase"], value="add",
-                                         label="Click Mode  (add=new object / refine=fix existing / erase=image only)")
+                    me_mode   = gr.Radio(["add", "erase"], value="add",
+                                         label="Click Mode  (add=new object / erase=remove object)")
 
                     with gr.Row():
                         me_btn_auto  = gr.Button("🔍 Auto Detect (PCS)", variant="primary")
@@ -1453,22 +1475,10 @@ with gr.Blocks() as demo:
                                 None, [], [], None, [], 0.0, 0, 0,
                                 [], None,
                                 "❌ VID_PREDICTOR not loaded.", None, None)
-                    session_id, temp_dir, frames, overlay, n_obj, status, out_fps, vid_h, vid_w = \
+                    session_id, temp_dir, frames, overlay, obj_masks_out, n_obj, status, out_fps, vid_h, vid_w = \
                         vid_start_session(vid_path, prompt, conf, float(target_fps), int(frame_lim))
 
-                    # build a display binary mask from overlay for bw preview
-                    binary = None
-                    obj_masks_out = []
-                    if frames and session_id:
-                        # get obj masks from initial detection
-                        try:
-                            resp  = VID_PREDICTOR.handle_request(dict(
-                                type="add_prompt", session_id=session_id,
-                                frame_index=0, text=_normalize_prompt(prompt)))
-                            obj_masks_out = _parse_native_outputs(resp.get("outputs", {}), vid_h, vid_w)
-                            binary = (_build_label_map(obj_masks_out, (vid_h, vid_w)) > 0).astype(np.uint8)
-                        except Exception:
-                            pass
+                    binary = (_build_label_map(obj_masks_out, (vid_h, vid_w)) > 0).astype(np.uint8) if obj_masks_out else None
 
                     return (
                         overlay,                # me_colored
@@ -1523,25 +1533,51 @@ with gr.Blocks() as demo:
             # ── Click handler (PVS) ───────────────────────────────────────
             def _click(img, is_vid, session_id, frames, vid_h, vid_w,
                        mask, mode, hist, pts, modes,
-                       prompt_hist, prompt,
+                       prompt_hist, prompt, prev_obj_masks,
                        evt: gr.SelectData):
                 x, y = evt.index
                 mode = mode or "add"
 
                 if is_vid and session_id:
                     # ── VIDEO MODE ────────────────────────────────────────
-                    label = 1 if mode in ("add", "refine") else 0
-                    obj_id = None  # new object for "add", nearest for "refine"
-                    overlay, obj_masks, status = vid_add_point(
-                        session_id, frames, vid_h, vid_w, x, y, label, obj_id)
-                    binary = (_build_label_map(obj_masks, (vid_h, vid_w)) > 0).astype(np.uint8) if obj_masks else None
-                    # push to history (without session_id — added at replay time)
-                    req_entry = dict(type="add_prompt", frame_index=0,
-                                     points=[[x/max(vid_w,1), y/max(vid_h,1)]],
-                                     point_labels=[label])
-                    new_hist = (list(prompt_hist) + [req_entry])[-MAX_VID_HIST:]
-                    return (overlay, _bw_preview(binary), new_hist,
-                            pts, modes, status, binary, obj_masks)
+                    frame0_pil = Image.fromarray(frames[0])
+                    if mode == "erase":
+                        clicked_obj_id = None
+                        yi, xi = int(y), int(x)
+                        for obj_id, obj_mask in (prev_obj_masks or []):
+                            if (0 <= yi < obj_mask.shape[0] and 0 <= xi < obj_mask.shape[1]
+                                    and obj_mask[yi, xi] > 0):
+                                clicked_obj_id = obj_id
+                                break
+                        if clicked_obj_id is None:
+                            overlay = _render_native_outputs(frame0_pil, prev_obj_masks or [])
+                            binary  = (_build_label_map(prev_obj_masks, (vid_h, vid_w)) > 0).astype(np.uint8) if prev_obj_masks else None
+                            return (overlay, _bw_preview(binary), prompt_hist,
+                                    pts, modes, "⚠️ Clicked background — no object to erase.",
+                                    binary, prev_obj_masks or [])
+                        _, _, status = vid_remove_object(session_id, frames, vid_h, vid_w, clicked_obj_id)
+                        merged_list = [(oid, m) for oid, m in (prev_obj_masks or []) if oid != clicked_obj_id]
+                        binary  = (_build_label_map(merged_list, (vid_h, vid_w)) > 0).astype(np.uint8) if merged_list else None
+                        overlay = _render_native_outputs(frame0_pil, merged_list)
+                        req_entry = dict(type="remove_object", frame_index=0, obj_id=clicked_obj_id)
+                        new_hist  = (list(prompt_hist) + [req_entry])[-MAX_VID_HIST:]
+                        return (overlay, _bw_preview(binary), new_hist,
+                                pts, modes, status, binary, merged_list)
+                    else:
+                        _, new_obj_masks, status = vid_add_point(
+                            session_id, frames, vid_h, vid_w, x, y, 1, None)
+                        merged = {oid: m for oid, m in (prev_obj_masks or [])}
+                        for oid, m in new_obj_masks:
+                            merged[oid] = m
+                        merged_list = list(merged.items())
+                        binary  = (_build_label_map(merged_list, (vid_h, vid_w)) > 0).astype(np.uint8) if merged_list else None
+                        overlay = _render_native_outputs(frame0_pil, merged_list)
+                        req_entry = dict(type="add_prompt", frame_index=0,
+                                         points=[[x/max(vid_w,1), y/max(vid_h,1)]],
+                                         point_labels=[1])
+                        new_hist = (list(prompt_hist) + [req_entry])[-MAX_VID_HIST:]
+                        return (overlay, _bw_preview(binary), new_hist,
+                                pts, modes, status, binary, merged_list)
                 else:
                     # ── IMAGE MODE ────────────────────────────────────────
                     ov, new_mask, hist, pts, modes, status = \
@@ -1554,7 +1590,7 @@ with gr.Blocks() as demo:
                 inputs=[st_me_img, st_is_video, st_session_id, st_vid_frames,
                         st_vid_h, st_vid_w,
                         st_me_mask, me_mode, st_me_hist, st_me_pts, st_me_modes,
-                        st_prompt_hist, me_prompt],
+                        st_prompt_hist, me_prompt, st_vid_obj_masks],
                 outputs=[me_pvs_overlay, me_mask_bw,
                          st_prompt_hist, st_me_pts, st_me_modes,
                          me_status, st_me_mask, st_vid_obj_masks],
