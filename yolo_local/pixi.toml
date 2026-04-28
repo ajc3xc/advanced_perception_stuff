@@ -1,0 +1,31 @@
+[workspace]
+channels = ["pytorch", "nvidia", "conda-forge"]
+channel-priority = "disabled"
+name = "yolo_local"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[system-requirements]
+cuda = "12.8"
+
+[tasks]
+train  = "python 3_train.py"
+infer  = "python 4_infer.py"
+
+[dependencies]
+python       = "3.12.*"
+pip          = ">=26,<27"
+pytorch-gpu  = "*"
+torchvision  = ">=0.22,<1"
+cuda-version = "12.8.*"
+numpy = ">=2.4.3,<3"
+matplotlib = ">=3.10.9,<4"
+ultralytics = ">=8.4.42,<9"
+libopencv = "*"
+py-opencv = "*"
+
+[pypi-dependencies]
+#ultralytics   = ">=8.3.0,<9"
+#opencv-python = ">=4.10,<5"
+#numpy         = "*"
+#matplotlib    = "*"

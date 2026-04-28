@@ -20,7 +20,7 @@ from datetime import datetime
 from ultralytics import YOLO
 
 # ── ONLY EDIT THIS ────────────────────────────────────────────────────────────
-BASE = Path("/blue/cli2/a.camerer/ABE6399_Robotics/advanced_robotic_systems/yolo/synthetic_data")
+BASE = Path(r"C:/Users/13144/Documents/PhD/Robotics_ABE6399/advanced_perception_stuff/yolo_local/synthetic_data")
 # ─────────────────────────────────────────────────────────────────────────────
 
 YOLO_ROOT  = BASE / "yolo_dataset"

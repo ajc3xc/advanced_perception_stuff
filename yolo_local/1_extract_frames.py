@@ -9,7 +9,7 @@ import cv2
 from pathlib import Path
 
 # ── ONLY EDIT THIS ────────────────────────────────────────────────────────────
-BASE = Path("/blue/cli2/a.camerer/ABE6399_Robotics/advanced_robotic_systems/yolo/synthetic_data")
+BASE = Path(r"C:/Users/13144/Documents/PhD/Robotics_ABE6399/advanced_perception_stuff/yolo_local/synthetic_data")
 # ─────────────────────────────────────────────────────────────────────────────
 
 SAM3_ROOT  = BASE / "sam3_outputs"
