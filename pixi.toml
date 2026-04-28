@@ -27,7 +27,6 @@ einops          = ">=0.8.2,<0.9"
 pycocotools     = ">=2.0.11,<3"
 psutil          = ">=7.2.2,<8"
 ftfy            = ">=6.3.1,<7"
-sam3            = ">=0.1.0.20251211,<0.2"
 sentencepiece   = ">=0.2.1,<0.3"
 imageio         = ">=2.37.0,<3"
 py-opencv       = "*"
@@ -39,8 +38,7 @@ ffmpeg          = ">=7.0,<8"
 pytz = ">=2026.1.post1,<2027"
 scikit-image = ">=0.26.0,<0.27"
 scikit-learn = ">=1.8.0,<2"
-
-[pypi-dependencies]
+sam3 = ">=0.1.0.20251211,<0.2"
 # decord — no win-64 conda build exists
 #decord  = ">=0.6.0,<0.7"
 # kernels + spaces — HF-specific, pypi only

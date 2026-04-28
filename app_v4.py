@@ -73,6 +73,11 @@ MAX_VID_HIST  = 10    # max undo steps for video session
 MAX_IMG_HIST  = 10    # max undo steps for image mask editor
 DEFAULT_INPUT_DIR  = "/blue/cli2/a.camerer/ABE6399_Robotics/inputs/lr_videos_left/"
 DEFAULT_OUTPUT_DIR = "/blue/cli2/a.camerer/ABE6399_Robotics/outputs/video/"
+# override defaults from saved config if present (set when user changes folders)
+def _get_saved_input_dir():
+    return _load_config().get("input_dir", DEFAULT_INPUT_DIR)
+def _get_saved_output_dir():
+    return _load_config().get("output_dir", DEFAULT_OUTPUT_DIR)
 DEFAULT_PROMPT     = os.environ.get("SAM3_DEFAULT_PROMPT", "bamboo")
 MODEL_REPO         = os.environ.get("SAM3_MODEL_REPO",    "jetjodh/sam3")
 # Local checkpoint path for native SAM3 predictor.
@@ -98,6 +103,28 @@ def _save_config(key: str, value):
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
     except Exception as e:
         print(f"[_save_config] failed: {e}")
+
+
+def _norm_path(p: str) -> str:
+    """
+    Normalise a folder path pasted from any OS into a clean forward-slash string.
+    Handles:
+      - surrounding quotes (single or double, e.g. pasted from Windows Explorer)
+      - backslashes  (Windows paths)
+      - mixed slashes
+      - leading/trailing whitespace
+    """
+    if not p:
+        return p
+    p = p.strip()
+    # strip wrapping quotes — Explorer sometimes wraps in double quotes
+    if len(p) >= 2 and p[0] in ('"', "'") and p[-1] == p[0]:
+        p = p[1:-1].strip()
+    # normalise backslashes to forward slashes
+    p = p.replace("\\", "/").replace("\\", "/")
+    # remove any trailing slash for consistency
+    p = p.rstrip("/")
+    return p
 
 
 def _resolve_sam3_checkpoint() -> tuple[str | None, str | None]:
@@ -127,11 +154,25 @@ def _resolve_sam3_checkpoint() -> tuple[str | None, str | None]:
         cache_dir = Path.home() / ".cache" / "sam3_local"
         cache_dir.mkdir(parents=True, exist_ok=True)
 
+        # load HF token from secret_token.txt if present, else env var, else none
+        hf_token = os.environ.get("HF_TOKEN") or None
+        token_file = Path(__file__).parent / "secret_token.txt"
+        if not hf_token and token_file.exists():
+            try:
+                hf_token = token_file.read_text().strip() or None
+                if hf_token:
+                    print(f"[_resolve_sam3_checkpoint] HF token loaded from secret_token.txt")
+            except Exception:
+                pass
+        if not hf_token:
+            print(f"[_resolve_sam3_checkpoint] no HF token found — downloads may be slow")
+
         print(f"[_resolve_sam3_checkpoint] downloading sam3.pt from {MODEL_REPO} …")
         ckpt_path = hf_hub_download(
             repo_id=MODEL_REPO,
             filename="sam3.pt",
             cache_dir=str(cache_dir),
+            token=hf_token,
         )
         print(f"[_resolve_sam3_checkpoint] checkpoint → {ckpt_path}")
 
@@ -206,6 +247,41 @@ IMG_PROCESSOR = None
 TRK_MODEL     = None
 TRK_PROCESSOR = None
 
+# ── set HF_TOKEN before any HuggingFace downloads ────────────────────────────
+_token_file = Path(__file__).parent / "secret_token.txt"
+if _token_file.exists() and "HF_TOKEN" not in os.environ:
+    _tok = _token_file.read_text().strip()
+    if _tok:
+        os.environ["HF_TOKEN"] = _tok
+        print(f"[models] HF_TOKEN set from secret_token.txt")
+
+# ── load transformers image models FIRST (while RAM is low) ──────────────────
+# Loading order matters: transformers downloads ~500MB when cache is cold.
+# With VID_PREDICTOR loaded first, RAM is already 5.5GB leaving no headroom
+# for the download buffer — process gets killed by the OS at C level.
+try:
+    if _TRANSFORMERS:
+        print("⏳  Loading transformers image models …")
+        print(f"  [1/4] Sam3Model.from_pretrained …", flush=True)
+        IMG_MODEL     = Sam3Model.from_pretrained(MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True).to(device)
+        print(f"  [2/4] Sam3Processor.from_pretrained …", flush=True)
+        IMG_PROCESSOR = Sam3Processor.from_pretrained(MODEL_REPO)
+        print(f"  [3/4] Sam3TrackerModel.from_pretrained …", flush=True)
+        TRK_MODEL     = Sam3TrackerModel.from_pretrained(MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True).to(device)
+        print(f"  [4/4] Sam3TrackerProcessor.from_pretrained …", flush=True)
+        TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(MODEL_REPO)
+        print(f"✅  Image models ready.  {_mem()}")
+except BaseException as e:
+    import traceback
+    print(f"❌  Image model load failed: {type(e).__name__}: {e}", flush=True)
+    traceback.print_exc()
+
+# ── load native SAM3 video predictor AFTER transformers (cache is warm) ──────
+_available_gb = psutil.virtual_memory().available / 1e9
+if _available_gb < 3.0:
+    print(f"⚠️  Low RAM warning: only {_available_gb:.1f}GB available before loading SAM3 predictor.")
+    print(f"   SAM3 needs ~4-5GB RAM. Close other apps if loading fails.")
+
 try:
     if _SAM3_NATIVE:
         print("⏳  Loading native SAM3 video predictor …")
@@ -220,7 +296,6 @@ try:
                 _build_kwargs["bpe_path"] = bpe_path
             VID_PREDICTOR = build_sam3_video_predictor(**_build_kwargs)
         else:
-            # fallback: let the package try facebook/sam3 (requires HF access)
             print("[VID_PREDICTOR] checkpoint download failed — falling back to load_from_HF=True")
             VID_PREDICTOR = build_sam3_video_predictor(gpus_to_use=[0] if device == "cuda" else [])
         print(f"✅  VID_PREDICTOR ready.  {_mem()}")
@@ -228,17 +303,6 @@ try:
         print("⚠️  native sam3 not available — video tab disabled")
 except Exception as e:
     print(f"❌  VID_PREDICTOR load failed: {e}")
-
-try:
-    if _TRANSFORMERS:
-        print("⏳  Loading transformers image models …")
-        IMG_MODEL     = Sam3Model.from_pretrained(MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True).to(device)
-        IMG_PROCESSOR = Sam3Processor.from_pretrained(MODEL_REPO)
-        TRK_MODEL     = Sam3TrackerModel.from_pretrained(MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True).to(device)
-        TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(MODEL_REPO)
-        print(f"✅  Image models ready.  {_mem()}")
-except Exception as e:
-    print(f"❌  Image model load failed: {e}")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SHARED UTILS  (model-agnostic, identical to v3)
@@ -350,7 +414,6 @@ def _parse_native_outputs(outputs, vid_h: int, vid_w: int):
     if outputs is None:
         return results
     try:
-        # use prepare_masks_for_visualization if available
         fmt = prepare_masks_for_visualization({0: outputs})
         frame_out = fmt.get(0, {})
         for obj_id, obj_data in frame_out.items():
@@ -362,7 +425,6 @@ def _parse_native_outputs(outputs, vid_h: int, vid_w: int):
             mask = np.asarray(mask).squeeze()
             if mask.ndim != 2:
                 continue
-            # resize if needed
             if mask.shape != (vid_h, vid_w):
                 mask = np.array(Image.fromarray(mask.astype(np.uint8)).resize(
                     (vid_w, vid_h), Image.NEAREST))
@@ -570,15 +632,37 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
 
     frame0_rgb = cv2.cvtColor(frame0_bgr, cv2.COLOR_BGR2RGB)
 
-    # ── write 1-frame stub folder for the session ─────────────────────────
+    # ── extract a small keyframe window so SAM3 text grounding works ────────
+    # SAM3 needs multiple frames loaded to run PCS text prompts — 1-frame
+    # sessions return empty outputs.  We extract up to N_KEYFRAME_FRAMES
+    # frames here so the session initialises properly, then expand to the
+    # full video at propagation time.
+    N_KEYFRAME_FRAMES = 30   # ~6s at 5fps — enough for text grounding
     temp_dir = tempfile.mkdtemp(prefix="sam3_frames_")
+    frames_for_session = [frame0_rgb]
     cv2.imwrite(str(Path(temp_dir) / "00000.jpg"), frame0_bgr)
 
-    # ── start session on the 1-frame stub ────────────────────────────────
+    cap2 = cv2.VideoCapture(video_path_str)
+    raw_idx2 = 0
+    while cap2.isOpened() and len(frames_for_session) < N_KEYFRAME_FRAMES:
+        if raw_idx2 % step == 0 and raw_idx2 > 0:
+            ret2, frm = cap2.read()
+            if not ret2: break
+            fi = len(frames_for_session)
+            cv2.imwrite(str(Path(temp_dir) / f"{fi:05d}.jpg"), frm)
+            frames_for_session.append(cv2.cvtColor(frm, cv2.COLOR_BGR2RGB))
+        else:
+            ret2 = cap2.grab()
+            if not ret2: break
+        raw_idx2 += 1
+    cap2.release()
+    print(f"[vid_start_session] keyframe window: {len(frames_for_session)} frames → {temp_dir}")
+
+    # ── start session on the keyframe window ─────────────────────────────
     try:
         resp       = VID_PREDICTOR.handle_request(dict(type="start_session", resource_path=temp_dir))
         session_id = resp["session_id"]
-        print(f"[vid_start_session] session_id={session_id} (stub, 1 frame)  {_mem()}")
+        print(f"[vid_start_session] session_id={session_id} ({len(frames_for_session)} frames)  {_mem()}")
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
         return None, None, [], None, 0, f"❌ start_session failed: {e}", out_fps, vid_h, vid_w
@@ -589,7 +673,7 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
         resp      = VID_PREDICTOR.handle_request(dict(
             type="add_prompt", session_id=session_id, frame_index=0, text=prompt,
         ))
-        out0      = resp.get("outputs", {})
+        out0      = resp.get("outputs", {}) if isinstance(resp, dict) else {}
         obj_masks = _parse_native_outputs(out0, vid_h, vid_w)
         n_obj     = len(obj_masks)
         frame0_pil = Image.fromarray(frame0_rgb)
@@ -598,6 +682,7 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
         status = (f"✅ PCS done — {n_obj} bamboo instance(s) on frame 0.  "
                   f"(full video will be extracted on Propagate)")
     except Exception as e:
+        import traceback; traceback.print_exc()
         status     = f"⚠️ Session started but PCS failed: {e}"
         overlay    = Image.fromarray(frame0_rgb)
         n_obj      = 0
@@ -1102,15 +1187,22 @@ with gr.Blocks() as demo:
         )
 
     # ── shared state ──────────────────────────────────────────────────────────
-    st_last_input_dir  = gr.State(DEFAULT_INPUT_DIR)
-    st_last_output_dir = gr.State(DEFAULT_OUTPUT_DIR)
+    _startup_input_dir  = _get_saved_input_dir()
+    _startup_output_dir = _get_saved_output_dir()
+
+    st_last_input_dir  = gr.State(_startup_input_dir)
+    st_last_output_dir = gr.State(_startup_output_dir)
 
     st_out_dir = gr.Textbox(
         label="Output Folder (shared)",
         placeholder="/path/to/output",
-        value=DEFAULT_OUTPUT_DIR,
+        value=_startup_output_dir,
     )
-    st_out_dir.change(fn=lambda v: v, inputs=[st_out_dir], outputs=[st_last_output_dir])
+    def _on_output_dir_change(v):
+        v = _norm_path(v)
+        _save_config("output_dir", v)
+        return v
+    st_out_dir.change(fn=_on_output_dir_change, inputs=[st_out_dir], outputs=[st_last_output_dir])
 
     shared_min_px = gr.Slider(0, 2000, value=_load_config().get("min_px", 50), step=10,
                                label="Min Region Size — output mask filter (0 = off)")
@@ -1171,12 +1263,16 @@ with gr.Blocks() as demo:
 
             # ── file loader ───────────────────────────────────────────────
             with gr.Row():
-                me_folder  = gr.Textbox(label="Input Folder", value=DEFAULT_INPUT_DIR, scale=4)
+                me_folder  = gr.Textbox(label="Input Folder", value=_startup_input_dir, scale=4)
                 me_refresh = gr.Button("🔄 Refresh", scale=0, min_width=90)
             me_file_dd     = gr.Dropdown(label="Select File", choices=[], interactive=True)
             me_load_btn    = gr.Button("Load Selected File", variant="secondary")
             me_load_status = gr.Textbox(label="Load Status", interactive=False, lines=1)
-            me_folder.change(fn=lambda v: v, inputs=[me_folder], outputs=[st_last_input_dir])
+            def _on_input_dir_change(v):
+                v = _norm_path(v)
+                _save_config("input_dir", v)
+                return v
+            me_folder.change(fn=_on_input_dir_change, inputs=[me_folder], outputs=[st_last_input_dir])
 
             gr.Markdown("---")
 
@@ -1234,6 +1330,9 @@ with gr.Blocks() as demo:
 
             # ── refresh ───────────────────────────────────────────────────
             def _refresh(folder, last_file):
+                folder = _norm_path(folder or "")
+                if folder:
+                    _save_config("input_dir", folder)
                 files = list_folder_media(folder)
                 if not files:
                     return gr.update(choices=[], value=None), "⚠️ No files found."
@@ -1245,6 +1344,8 @@ with gr.Blocks() as demo:
 
             # ── load file ─────────────────────────────────────────────────
             def _load(folder, filename, out_dir):
+                folder  = _norm_path(folder or "")
+                out_dir = _norm_path(out_dir or "")
                 pil, is_vid, full_path, status, native_fps = load_media_file(folder, filename)
                 tab3_vis = gr.update(visible=is_vid)
                 fps_update = gr.update(maximum=int(native_fps),

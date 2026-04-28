@@ -27,6 +27,7 @@ synthetic_data/
 
 # Emacs
 .#*
+secret_token.txt
 
 .vscode/
 *.log
@@ -44,3 +45,6 @@ pixi_backups/
 
 # Synthetic datasets and generated artifacts
 yolo_roboflow/synthetic_data/
+
+# MCP config (contains local paths)
+.mcp.json

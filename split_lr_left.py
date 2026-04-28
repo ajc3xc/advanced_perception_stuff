@@ -12,8 +12,8 @@ import shutil
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 
-IN_DIR  = Path("/blue/cli2/a.camerer/ABE6399_Robotics/inputs")
-OUT_DIR = Path("/blue/cli2/a.camerer/ABE6399_Robotics/inputs/lr_videos_left")
+IN_DIR  = Path(r"C:\Users\13144\Documents\PhD\Robotics_ABE6399\inputs\videos")
+OUT_DIR = Path(r"C:\Users\13144\Documents\PhD\Robotics_ABE6399\inputs\videos_left_preprocess")
 
 # Number of files to process in parallel — keep <= number of GPUs to avoid
 # NVENC session limits (NVIDIA caps at 8 concurrent NVENC sessions per GPU)
