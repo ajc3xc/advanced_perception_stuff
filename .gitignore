@@ -39,3 +39,6 @@ AMENT_IGNORE
 
 pixi_backups/
 *.exe
+
+# Synthetic datasets and generated artifacts
+yolo_roboflow/synthetic_data/
