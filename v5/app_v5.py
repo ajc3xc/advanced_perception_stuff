@@ -25,7 +25,7 @@ Tab 3 — Video Propagator     : visible ONLY when video session active in Tab 2
 """
 
 import os
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import cv2
 import json
 import time
