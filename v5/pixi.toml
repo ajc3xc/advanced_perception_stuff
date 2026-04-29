@@ -20,14 +20,13 @@ torchvision     = ">=0.22,<1"
 cuda-version    = "12.8.*"
 pillow          = ">=11.3.0,<13"
 setuptools      = "<80"
-numpy           = "*"
+numpy           = ">=1.26,<2"   # sam3 requires numpy<2
 matplotlib      = "*"
 huggingface_hub = ">=1.5.0,<2"
 iopath          = ">=0.1.10,<0.2"
 einops          = ">=0.8.2,<0.9"
 pycocotools     = ">=2.0.11,<3"
 psutil          = ">=7.2.2,<8"
-ftfy            = ">=6.3.1,<7"
 sentencepiece   = ">=0.2.1,<0.3"
 imageio         = ">=2.37.0,<3"
 py-opencv       = "*"
@@ -44,3 +43,4 @@ ninja           = "*"
 [pypi-dependencies]
 # Official facebookresearch/sam3 — includes Object Multiplex (SAM3.1 inference)
 sam3 = { git = "https://github.com/facebookresearch/sam3.git" }
+ftfy = "==6.1.1"  # pinned to match sam3's requirement

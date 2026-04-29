@@ -58,7 +58,7 @@ from gradio.themes.utils import colors, fonts, sizes
 
 # ── native SAM3 imports ───────────────────────────────────────────────────────
 try:
-    from sam3.model_builder import build_sam3_video_predictor
+    from sam3.model_builder import build_sam3_multiplex_video_predictor
     from sam3.visualization_utils import prepare_masks_for_visualization
     _SAM3_NATIVE = True
 except Exception as e:
@@ -80,8 +80,8 @@ IMG_EXTS      = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 VID_EXTS      = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 MAX_VID_HIST  = 10    # max undo steps for video session
 MAX_IMG_HIST  = 10    # max undo steps for image mask editor
-DEFAULT_INPUT_DIR  = "/blue/cli2/a.camerer/ABE6399_Robotics/inputs/lr_videos_left/"
-DEFAULT_OUTPUT_DIR = "/blue/cli2/a.camerer/ABE6399_Robotics/outputs/video/"
+DEFAULT_INPUT_DIR  = ""
+DEFAULT_OUTPUT_DIR = ""
 def _get_saved_input_dir():
     return _load_config().get("input_dir", DEFAULT_INPUT_DIR)
 def _get_saved_output_dir():
@@ -89,8 +89,12 @@ def _get_saved_output_dir():
 DEFAULT_PROMPT     = os.environ.get("SAM3_DEFAULT_PROMPT", "bamboo")
 # ── v5 change: default to jetjodh/sam3.1 (Object Multiplex checkpoint) ───────
 MODEL_REPO         = os.environ.get("SAM3_MODEL_REPO",    "jetjodh/sam3.1")
+# jetjodh/sam3.1 only has the native checkpoint (sam3.pt), no transformers weights.
+# Fall back to jetjodh/sam3 for the transformers image models (Tab 1 + Tab 2 image mode).
+IMG_MODEL_REPO     = os.environ.get("SAM3_IMG_MODEL_REPO", "jetjodh/sam3")
 SAM3_CHECKPOINT_PATH = os.environ.get("SAM3_CHECKPOINT_PATH", "")
-CONFIG_PATH        = Path(DEFAULT_OUTPUT_DIR) / ".sam3_ui_config.json"
+# Config lives next to the app file — always writable, no dependency on output dir
+CONFIG_PATH        = Path(__file__).parent / ".sam3_ui_config.json"
 
 def _load_config() -> dict:
     try:
@@ -102,10 +106,10 @@ def _load_config() -> dict:
 
 def _save_config(key: str, value):
     try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         cfg = _load_config()
         cfg[key] = value
         CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+        print(f"[_save_config] {key}={value!r} → {CONFIG_PATH}")
     except Exception as e:
         print(f"[_save_config] failed: {e}")
 
@@ -152,10 +156,10 @@ def _resolve_sam3_checkpoint() -> tuple[str | None, str | None]:
         if not hf_token:
             print(f"[_resolve_sam3_checkpoint] no HF token — jetjodh/sam3.1 is ungated, should be fine")
 
-        print(f"[_resolve_sam3_checkpoint] downloading sam3.pt from {MODEL_REPO} …")
+        print(f"[_resolve_sam3_checkpoint] downloading sam3.1_multiplex.pt from facebook/sam3.1 …")
         ckpt_path = hf_hub_download(
-            repo_id=MODEL_REPO,
-            filename="sam3.pt",
+            repo_id="facebook/sam3.1",
+            filename="sam3.1_multiplex.pt",
             cache_dir=str(cache_dir),
             token=hf_token,
         )
@@ -238,23 +242,77 @@ if _token_file.exists() and "HF_TOKEN" not in os.environ:
         os.environ["HF_TOKEN"] = _tok
         print(f"[models] HF_TOKEN set from {_token_file}")
 
-# ── load transformers image models FIRST (while RAM is low) ──────────────────
+# ── load transformers image models ──────────────────────────────────────────
+# IMG_MODEL/PROCESSOR: lazy — NOT loaded at startup. Loaded on first use in
+#   Tab 1 or Tab 2 image mode via _ensure_img_model(). Saves ~2GB VRAM
+#   permanently if you only use video mode.
+# TRK_MODEL/PROCESSOR: loaded to CPU now. Moved to GPU on demand for click
+#   refinement, moved back to CPU immediately after. Saves ~1.5GB VRAM
+#   during video propagation.
 try:
     if _TRANSFORMERS:
-        print("⏳  Loading transformers image models …")
-        print(f"  [1/4] Sam3Model.from_pretrained …", flush=True)
-        IMG_MODEL     = Sam3Model.from_pretrained(MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True).to(device)
-        print(f"  [2/4] Sam3Processor.from_pretrained …", flush=True)
-        IMG_PROCESSOR = Sam3Processor.from_pretrained(MODEL_REPO)
-        print(f"  [3/4] Sam3TrackerModel.from_pretrained …", flush=True)
-        TRK_MODEL     = Sam3TrackerModel.from_pretrained(MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True).to(device)
-        print(f"  [4/4] Sam3TrackerProcessor.from_pretrained …", flush=True)
-        TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(MODEL_REPO)
-        print(f"✅  Image models ready.  {_mem()}")
+        print("⏳  Loading TRK_MODEL to CPU (lazy GPU on click) …")
+        TRK_MODEL     = Sam3TrackerModel.from_pretrained(IMG_MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True)  # stays on CPU
+        TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(IMG_MODEL_REPO)
+        print(f"✅  TRK_MODEL on CPU ready.  {_mem()}")
+        print("ℹ️   IMG_MODEL deferred — will load on first image segmentation use.")
 except BaseException as e:
     import traceback
-    print(f"❌  Image model load failed: {type(e).__name__}: {e}", flush=True)
+    print(f"❌  TRK model load failed: {type(e).__name__}: {e}", flush=True)
     traceback.print_exc()
+
+_img_model_loaded = False  # tracks whether IMG_MODEL has been loaded yet
+_img_model_lock   = threading.Lock()
+
+def _ensure_img_model():
+    """Lazy-load IMG_MODEL/PROCESSOR to GPU on first use. Thread-safe."""
+    global IMG_MODEL, IMG_PROCESSOR, _img_model_loaded
+    if _img_model_loaded:
+        return
+    with _img_model_lock:
+        if _img_model_loaded:  # double-check after acquiring lock
+            return
+        if not _TRANSFORMERS:
+            raise gr.Error("transformers not available — image model cannot be loaded.")
+        try:
+            print(f"⏳  Lazy-loading IMG_MODEL to GPU …  {_mem()}")
+            IMG_MODEL     = Sam3Model.from_pretrained(IMG_MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True).to(device)
+            IMG_PROCESSOR = Sam3Processor.from_pretrained(IMG_MODEL_REPO)
+            _img_model_loaded = True
+            print(f"✅  IMG_MODEL loaded.  {_mem()}")
+        except Exception as _le:
+            raise gr.Error(f"IMG_MODEL load failed: {_le}")
+
+def _trk_to_gpu():
+    """Move TRK_MODEL to GPU for inference."""
+    if TRK_MODEL is not None and next(TRK_MODEL.parameters()).device.type != device:
+        print(f"[trk] moving TRK_MODEL → GPU  {_mem()}")
+        TRK_MODEL.to(device)
+        torch.cuda.synchronize()
+        print(f"[trk] TRK_MODEL on GPU  {_mem()}")
+
+def _trk_to_cpu():
+    """Move TRK_MODEL back to CPU to free VRAM."""
+    if TRK_MODEL is not None and next(TRK_MODEL.parameters()).device.type != 'cpu':
+        print(f"[trk] moving TRK_MODEL → CPU  {_mem()}")
+        TRK_MODEL.to('cpu')
+        torch.cuda.empty_cache()
+        print(f"[trk] TRK_MODEL on CPU  {_mem()}")
+
+# ── Windows patches: apply sam3_vitdet.py fixes before loading predictor ─────
+# Same patches as v4: triton→CPU connected-components, NMS, vitdet geometry.
+try:
+    _patch_script = Path(__file__).parent / "sam3_vitdet.py"
+    if _patch_script.exists():
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location("sam3_vitdet", _patch_script)
+        _mod  = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        print(f"[patches] sam3_vitdet.py applied from {_patch_script}")
+    else:
+        print(f"[patches] sam3_vitdet.py not found at {_patch_script} — skipping")
+except Exception as _pe:
+    print(f"[patches] sam3_vitdet.py failed: {_pe}")
 
 # ── load native SAM3.1 video predictor ───────────────────────────────────────
 _available_gb = psutil.virtual_memory().available / 1e9
@@ -269,33 +327,99 @@ try:
             print(f"[VID_PREDICTOR] load_from_HF=False  ckpt={ckpt_path}")
             _build_kwargs = dict(
                 checkpoint_path=ckpt_path,
-                gpus_to_use=[0] if device == "cuda" else [],
+                use_fa3=False,          # FA3 not available on Windows
+                use_rope_real=True,     # required when use_fa3=False
+                max_num_objects=32,     # Object Multiplex — main reason we use 3.1
             )
             if bpe_path:
                 _build_kwargs["bpe_path"] = bpe_path
-            VID_PREDICTOR = build_sam3_video_predictor(**_build_kwargs)
+            VID_PREDICTOR = build_sam3_multiplex_video_predictor(**_build_kwargs)
         else:
             print("[VID_PREDICTOR] checkpoint download failed — falling back to load_from_HF=True")
-            VID_PREDICTOR = build_sam3_video_predictor(gpus_to_use=[0] if device == "cuda" else [])
+            VID_PREDICTOR = build_sam3_multiplex_video_predictor(use_fa3=False, use_rope_real=True)
         print(f"✅  VID_PREDICTOR ready.  {_mem()}")
     else:
         print("⚠️  native sam3 not available — video tab disabled")
 except Exception as e:
     print(f"❌  VID_PREDICTOR load failed: {e}")
 
-# ── Blanket BFloat16 fix: hook every Conv2d in the video predictor ─────────────
-# May still be needed on Windows even with the new package.
+# ── All bf16 autocast contexts are now disabled at construction time ────────
+# (see patches to sam3_multiplex_base.py Sam3MultiplexTrackerPredictor and
+# Sam3MultiplexPredictorWrapper). No runtime context cleanup needed.
 if VID_PREDICTOR is not None:
-    def _conv_dtype_hook(module, args):
+    VID_PREDICTOR.model.to(torch.float32)
+    # The tracker wrapper holds the inner VideoTrackingMultiplexDemo as .model;
+    # it may have been built in bf16 inside model_builder. Cast everything.
+    try:
+        VID_PREDICTOR.model.tracker.model.to(torch.float32)
+    except Exception as _e:
+        print(f"[dtype] tracker.model cast: {_e}")
+    torch.cuda.empty_cache()
+    print(f"[dtype] VID_PREDICTOR running float32  {_mem()}")
+
+    # ── VRAM→RAM offload: move maskmem outputs to CPU as frames are processed ─
+    # Stops VRAM growing ~400MB/10frames by offloading frame outputs to RAM.
+    # Your 31.5GB DDR5 can hold 433 frames × 32 objects of maskmem features.
+    # Quality: zero impact — features are moved back to GPU on demand via
+    # .cuda(non_blocking=True) in _prepare_memory_conditioned_features.
+    # Risk: if RAM fills up Windows will page to disk and slow to a crawl.
+    # Revert by setting offload_output_to_cpu_for_eval = False.
+    try:
+        inner = VID_PREDICTOR.model.tracker.model.tracker
+        inner.offload_output_to_cpu_for_eval = True
+        print(f"[vram-offload] offload_output_to_cpu_for_eval=True on {type(inner).__name__}")
+    except Exception as _oe:
+        print(f"[vram-offload] failed: {_oe}")
+
+# ── Blanket dtype fix: hook every Conv2d+Linear+LayerNorm in the video predictor
+if VID_PREDICTOR is not None:
+    # Audit: count bf16 modules before hooking so we can verify the fix is needed
+    try:
+        _bf16_modules = [
+            (type(m).__name__, name)
+            for name, m in VID_PREDICTOR.model.named_modules()
+            if hasattr(m, 'weight') and m.weight is not None
+            and m.weight.dtype == torch.bfloat16
+        ]
+        print(f"[dtype-audit] {len(_bf16_modules)} bf16-weight modules found before hook registration")
+        if _bf16_modules:
+            # Show first 5 as a sample so we know exactly which layers need fixing
+            for _mtype, _mname in _bf16_modules[:5]:
+                print(f"  bf16 module: {_mtype}  path={_mname}")
+            if len(_bf16_modules) > 5:
+                print(f"  ... and {len(_bf16_modules) - 5} more")
+        else:
+            print("[dtype-audit] ✅ No bf16-weight modules — model is already fully float32")
+    except Exception as _audit_e:
+        print(f"[dtype-audit] audit failed (non-fatal): {_audit_e}")
+
+    def _dtype_hook(module, args):
         x = args[0]
-        if isinstance(x, torch.Tensor) and x.dtype != module.weight.dtype:
+        if not isinstance(x, torch.Tensor): return
+        # For LayerNorm: cast input to match weight dtype
+        if isinstance(module, torch.nn.LayerNorm):
+            if module.weight is not None and x.dtype != module.weight.dtype:
+                print(f"[dtype-hook] LayerNorm cast {x.dtype} → {module.weight.dtype}  "
+                      f"(module={type(module).__name__})")
+                return (x.to(module.weight.dtype),) + args[1:]
+        # For Conv2d/Linear: cast input to match weight dtype
+        elif hasattr(module, 'weight') and module.weight is not None \
+                and x.dtype != module.weight.dtype:
             return (x.to(module.weight.dtype),) + args[1:]
-    _n_hooks = sum(
-        1 for _m in VID_PREDICTOR.model.modules()
-        if isinstance(_m, torch.nn.Conv2d)
-        and not _m.register_forward_pre_hook(_conv_dtype_hook)
-    )
-    print(f"[dtype-hooks] Conv2d input-cast hooks registered on VID_PREDICTOR")
+
+    # Register hooks — wrapped in try/except so a bad module never kills startup
+    _n_hooks = 0
+    _n_hook_errors = 0
+    for _m in VID_PREDICTOR.model.modules():
+        if isinstance(_m, (torch.nn.Conv2d, torch.nn.Linear, torch.nn.LayerNorm)):
+            try:
+                _m.register_forward_pre_hook(_dtype_hook)
+                _n_hooks += 1
+            except Exception as _he:
+                _n_hook_errors += 1
+                print(f"[dtype-hooks] hook registration failed on {type(_m).__name__}: {_he}")
+    print(f"[dtype-hooks] ✅ registered on {_n_hooks} modules "
+          f"(Conv2d+Linear+LayerNorm)  errors={_n_hook_errors}")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SHARED UTILS
@@ -456,6 +580,7 @@ def _build_label_map(obj_masks: list, shape_hw: tuple) -> np.ndarray:
 # ═════════════════════════════════════════════════════════════════════════════
 def run_image_segmentation(source_img, text_query, conf_thresh: float = 0.5):
     print(f"[run_image_segmentation] START prompt='{text_query}' {_mem()}")
+    _ensure_img_model()
     if IMG_MODEL is None or IMG_PROCESSOR is None:
         raise gr.Error("Image model not loaded.")
     if source_img is None:
@@ -485,6 +610,7 @@ def run_image_segmentation(source_img, text_query, conf_thresh: float = 0.5):
 # ═════════════════════════════════════════════════════════════════════════════
 def run_pcs_dual(source_img, text_query, conf_thresh: float = 0.5):
     print(f"[run_pcs_dual] START prompt='{text_query}' conf={conf_thresh} {_mem()}")
+    _ensure_img_model()
     if IMG_MODEL is None or IMG_PROCESSOR is None:
         raise gr.Error("Image model not loaded.")
     if source_img is None:
@@ -519,31 +645,35 @@ def tracker_single_click_mask(image_pil: Image.Image, x: int, y: int):
     if TRK_MODEL is None or TRK_PROCESSOR is None:
         raise gr.Error("Tracker model not loaded.")
     if image_pil is None: return None
-    inputs = TRK_PROCESSOR(
-        images=image_pil,
-        input_points=[[[[int(x), int(y)]]]],
-        input_labels=[[[1]]],
-        return_tensors="pt",
-    ).to(device)
-    with torch.no_grad():
-        outputs = TRK_MODEL(**inputs, multimask_output=True)
-    masks = TRK_PROCESSOR.post_process_masks(
-        outputs.pred_masks.cpu(), inputs["original_sizes"], binarize=True,
-    )[0]
-    if hasattr(outputs, "iou_scores") and outputs.iou_scores is not None:
-        try:
-            best = int(torch.argmax(outputs.iou_scores.detach().cpu()[0, 0]).item())
-        except Exception:
+    _trk_to_gpu()
+    try:
+        inputs = TRK_PROCESSOR(
+            images=image_pil,
+            input_points=[[[[int(x), int(y)]]]],
+            input_labels=[[[1]]],
+            return_tensors="pt",
+        ).to(device)
+        with torch.no_grad():
+            outputs = TRK_MODEL(**inputs, multimask_output=True)
+        masks = TRK_PROCESSOR.post_process_masks(
+            outputs.pred_masks.cpu(), inputs["original_sizes"], binarize=True,
+        )[0]
+        if hasattr(outputs, "iou_scores") and outputs.iou_scores is not None:
+            try:
+                best = int(torch.argmax(outputs.iou_scores.detach().cpu()[0, 0]).item())
+            except Exception:
+                best = 0
+        else:
             best = 0
-    else:
-        best = 0
-    if isinstance(masks, torch.Tensor): masks = masks.detach().cpu().numpy()
-    masks = np.asarray(masks)
-    if   masks.ndim == 4: click_mask = masks[0, best]
-    elif masks.ndim == 3: click_mask = masks[0]
-    else: return None
-    print(f"[tracker_single_click_mask] END {_mem()}")
-    return (click_mask > 0).astype(np.uint8)
+        if isinstance(masks, torch.Tensor): masks = masks.detach().cpu().numpy()
+        masks = np.asarray(masks)
+        if   masks.ndim == 4: click_mask = masks[0, best]
+        elif masks.ndim == 3: click_mask = masks[0]
+        else: return None
+        print(f"[tracker_single_click_mask] END {_mem()}")
+        return (click_mask > 0).astype(np.uint8)
+    finally:
+        _trk_to_cpu()
 
 
 def _push_img_history(hist, mask, pts, modes):
@@ -589,7 +719,7 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
                       target_fps: float, frame_limit: int):
     print(f"[vid_start_session] START path={video_path_str} {_mem()}")
     if VID_PREDICTOR is None:
-        return None, None, [], None, 0, "❌ VID_PREDICTOR not loaded.", 0.0, 0, 0
+        return None, None, [], None, [], 0, "❌ VID_PREDICTOR not loaded.", 0.0, 0, 0
 
     try:
         VID_PREDICTOR.model.score_threshold_detection = float(conf)
@@ -609,7 +739,7 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
     print(f"[vid_start_session] src_fps={fps} step={step} out_fps={out_fps} w={vid_w} h={vid_h}")
 
     if not ret:
-        return None, None, [], None, 0, "❌ Could not read frame 0.", out_fps, vid_h, vid_w
+        return None, None, [], None, [], 0, "❌ Could not read frame 0.", out_fps, vid_h, vid_w
 
     frame0_rgb = cv2.cvtColor(frame0_bgr, cv2.COLOR_BGR2RGB)
 
@@ -642,7 +772,7 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
         print(f"[vid_start_session] session_id={session_id} ({len(frames_for_session)} frames)  {_mem()}")
     except Exception as e:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        return None, None, [], None, 0, f"❌ start_session failed: {e}", out_fps, vid_h, vid_w
+        return None, None, [], None, [], 0, f"❌ start_session failed: {e}", out_fps, vid_h, vid_w
 
     prompt = _normalize_prompt(prompt)
     try:
@@ -981,6 +1111,13 @@ def run_video_propagation(
     print(f"[run_video_propagation] {n} frames {vid_w}x{vid_h} out_fps={out_fps:.1f}")
     yield None, f"⏳ Propagating {n} frames …  {_mem()}"
 
+    # Free the frames list from RAM — we'll read each frame from the temp_dir JPGs instead.
+    # At 1 FPS, 433 frames × 1280×720×3 = ~1.1 GB held in RAM during propagation.
+    frames_dir = Path(temp_dir)
+    n_jpg = len(list(frames_dir.glob("*.jpg")))
+    print(f"[run_video_propagation] frames_dir={frames_dir}  jpg_count={n_jpg}  freeing in-RAM frames list")
+    frames = None  # allow GC
+
     tmp_mp4  = tempfile.mktemp(suffix=".mp4")
     real_mp4 = out_dir / "overlay.mp4"
     writer   = cv2.VideoWriter(tmp_mp4, cv2.VideoWriter_fourcc(*"mp4v"),
@@ -994,36 +1131,60 @@ def run_video_propagation(
         )):
             f_idx     = response.get("frame_index", 0)
             raw_out   = response.get("outputs", {})
-            obj_masks = _parse_native_outputs(raw_out, vid_h, vid_w)
+
+            # Per-frame try/except — a dtype mismatch or OOM on one frame
+            # must not kill the entire propagation run.
+            try:
+                obj_masks = _parse_native_outputs(raw_out, vid_h, vid_w)
+            except Exception as _pno_e:
+                print(f"[run_video_propagation] ⚠️  frame {f_idx} parse failed: {_pno_e}")
+                obj_masks = []
 
             if f_idx % 5 == 0:
                 msg = f"⏳ Frame {f_idx}/{n}  {len(obj_masks)} objects  {_mem()}"
                 print(f"[run_video_propagation] {msg}")
                 yield None, "\n".join(reversed(log_lines[-20:])) + "\n" + msg
 
-            orig = Image.fromarray(frames[f_idx]) if f_idx < len(frames) else Image.fromarray(frames[-1])
+            # Periodic VRAM cache flush to prevent fragmentation creep
+            if f_idx > 0 and f_idx % 10 == 0:
+                torch.cuda.empty_cache()
+                print(f"[run_video_propagation] empty_cache @ frame {f_idx}  {_mem()}")
 
-            if obj_masks:
-                label_map = _build_label_map(obj_masks, (vid_h, vid_w))
-                if min_region_px > 0:
-                    obj_masks_clean = [(oid, remove_small_regions(m, min_region_px)) for oid, m in obj_masks]
-                    label_map = _build_label_map(obj_masks_clean, (vid_h, vid_w))
-                overlay_frame = _render_native_outputs(orig, obj_masks)
-            else:
-                label_map     = np.zeros((vid_h, vid_w), dtype=np.uint8)
-                overlay_frame = orig
+            try:
+                # Read frame from disk (JPG in temp_dir) to avoid holding 433 frames in RAM
+                jpg_path = Path(temp_dir) / f"{f_idx:05d}.jpg"
+                if jpg_path.exists():
+                    orig = Image.open(jpg_path).convert("RGB")
+                    print(f"[run_video_propagation] frame {f_idx} read from disk") if f_idx == 0 else None
+                else:
+                    # Fallback: if JPG missing, write a blank frame and warn
+                    print(f"[run_video_propagation] ⚠️  frame {f_idx} JPG missing at {jpg_path}")
+                    orig = Image.new("RGB", (vid_w, vid_h), (0, 0, 0))
 
-            fn = f"{f_idx:06d}"
-            Image.fromarray(label_map).save(mask_dir / f"{fn}.png")
-            np.save(mask_dir / f"{fn}.npy", label_map)
-            Image.fromarray(np.array(overlay_frame)).save(ovl_dir / f"{fn}.png")
-            (meta_dir / f"{fn}.json").write_text(json.dumps({
-                "frame_idx": f_idx, "n_objects": len(obj_masks),
-                "obj_ids": [int(oid) for oid, _ in obj_masks],
-                "shape_hw": [vid_h, vid_w], "timestamp": datetime.now().isoformat(),
-            }, indent=2))
-            writer.write(cv2.cvtColor(np.array(overlay_frame), cv2.COLOR_RGB2BGR))
-            log_lines.append(f"[{f_idx:05d}/{n}] {len(obj_masks)} obj")
+                if obj_masks:
+                    label_map = _build_label_map(obj_masks, (vid_h, vid_w))
+                    if min_region_px > 0:
+                        obj_masks_clean = [(oid, remove_small_regions(m, min_region_px)) for oid, m in obj_masks]
+                        label_map = _build_label_map(obj_masks_clean, (vid_h, vid_w))
+                    overlay_frame = _render_native_outputs(orig, obj_masks)
+                else:
+                    label_map     = np.zeros((vid_h, vid_w), dtype=np.uint8)
+                    overlay_frame = orig
+
+                fn = f"{f_idx:06d}"
+                Image.fromarray(label_map).save(mask_dir / f"{fn}.png")
+                np.save(mask_dir / f"{fn}.npy", label_map)
+                Image.fromarray(np.array(overlay_frame)).save(ovl_dir / f"{fn}.png")
+                (meta_dir / f"{fn}.json").write_text(json.dumps({
+                    "frame_idx": f_idx, "n_objects": len(obj_masks),
+                    "obj_ids": [int(oid) for oid, _ in obj_masks],
+                    "shape_hw": [vid_h, vid_w], "timestamp": datetime.now().isoformat(),
+                }, indent=2))
+                writer.write(cv2.cvtColor(np.array(overlay_frame), cv2.COLOR_RGB2BGR))
+                log_lines.append(f"[{f_idx:05d}/{n}] {len(obj_masks)} obj")
+            except Exception as _frame_e:
+                print(f"[run_video_propagation] ⚠️  frame {f_idx} save failed: {_frame_e}")
+                log_lines.append(f"[{f_idx:05d}/{n}] ❌ {_frame_e}")
 
     except Exception as e:
         writer.release()
@@ -1086,6 +1247,8 @@ with gr.Blocks() as demo:
 
     _startup_input_dir  = _get_saved_input_dir()
     _startup_output_dir = _get_saved_output_dir()
+    _startup_target_fps  = _load_config().get("target_fps", 5)
+    _startup_frame_limit = _load_config().get("frame_limit", 0)
 
     st_last_input_dir  = gr.State(_startup_input_dir)
     st_last_output_dir = gr.State(_startup_output_dir)
@@ -1118,6 +1281,7 @@ with gr.Blocks() as demo:
     st_pcs_masks     = gr.State([])
     st_pending_pts   = gr.State([])
     st_last_file     = gr.State(None)
+    st_shared_mask   = gr.State(None)
 
     with gr.Tabs(selected=1):
 
@@ -1134,6 +1298,8 @@ with gr.Blocks() as demo:
             t1_btn.click(fn=run_image_segmentation, inputs=[t1_img, t1_prompt, t1_conf], outputs=[t1_result])
 
         with gr.Tab("Mask Editor", id=1):
+            # declare tab_video_prop early so it can be referenced in me_load_btn.click outputs
+            tab_video_prop = gr.Tab("Video Propagator", visible=False, id=2)
             gr.Markdown(f"""
 **Image mode:** Load image → Auto Detect (PCS) → click to add/erase regions (PVS) → Save.
 
@@ -1202,8 +1368,8 @@ with gr.Blocks() as demo:
 
             vp_keyframe_preview = gr.Image(type="pil", visible=False,
                                            label="Frame 0 Detection Preview", height=200, interactive=False)
-            vp_target_fps = gr.Slider(0, 30, value=5, step=1, visible=False, label="Target FPS (0 = source FPS)")
-            vp_framelim   = gr.Slider(0, 2000, value=0, step=10, visible=False, label="Frame Limit (0 = all frames)")
+            vp_target_fps = gr.Slider(0, 30, value=_startup_target_fps, step=1, visible=False, label="Target FPS (0 = source FPS)")
+            vp_framelim   = gr.Slider(0, 2000, value=_startup_frame_limit, step=10, visible=False, label="Frame Limit (0 = all frames)")
 
             def _refresh(folder, last_file):
                 folder = _norm_path(folder or "")
@@ -1216,47 +1382,87 @@ with gr.Blocks() as demo:
             me_refresh.click(fn=_refresh, inputs=[me_folder, st_last_file], outputs=[me_file_dd, me_load_status])
 
             def _load(folder, filename, out_dir):
+                print(f"[_load] called: folder={folder!r} filename={filename!r} out_dir={out_dir!r}")
+                # Guard: don't run if no file is selected yet
+                if not filename:
+                    print("[_load] no filename — returning early")
+                    return (None, None, False, None, "", gr.update(visible=False),
+                            None, None, None, [], [], [],
+                            None, None, None, None, None, gr.update(),
+                            None, [], None)
                 folder  = _norm_path(folder or "")
                 out_dir = _norm_path(out_dir or "")
                 pil, is_vid, full_path, status, native_fps = load_media_file(folder, filename)
+                print(f"[_load] is_vid={is_vid} full_path={full_path} native_fps={native_fps}")
                 tab3_vis   = gr.update(visible=is_vid)
-                fps_update = gr.update(maximum=int(native_fps), value=min(5, int(native_fps)),
+                # Use saved target_fps from config, capped to native_fps
+                saved_fps = _load_config().get("target_fps", 5)
+                fps_val   = min(int(saved_fps), int(native_fps)) if is_vid else 5
+                fps_update = gr.update(maximum=int(native_fps), value=fps_val,
                                        label=f"Target FPS (0 = keep source {native_fps:.1f}fps)"
                                        ) if is_vid else gr.update()
+                print(f"[_load] fps_val={fps_val} (saved={saved_fps}, native={native_fps})")
                 existing_mask = existing_colored = existing_pvs_ov = existing_bw = None
                 if full_path and out_dir and out_dir.strip() and pil is not None:
                     stem  = Path(full_path).stem
-                    fname = "mask_frame000000.png" if is_vid else "mask.png"
-                    mask_path = Path(out_dir.strip()) / stem / fname
-                    if mask_path.exists():
+                    # Video: check for both propagation masks/frame output AND keyframe save
+                    candidates = []
+                    if is_vid:
+                        candidates = [
+                            Path(out_dir.strip()) / stem / "masks" / "000000.png",      # propagation output
+                            Path(out_dir.strip()) / stem / "mask_frame000000.png",      # keyframe save (video)
+                            Path(out_dir.strip()) / stem / "overlays" / "000000.png",   # overlay direct
+                        ]
+                    else:
+                        candidates = [Path(out_dir.strip()) / stem / "mask.png"]
+                    print(f"[_load] checking cache candidates: {[str(c) for c in candidates]}")
+                    mask_path = next((c for c in candidates if c.exists()), None)
+                    if mask_path:
+                        print(f"[_load] found cached mask: {mask_path}")
                         try:
                             m = np.array(Image.open(mask_path).convert("L"))
                             existing_mask = (m > 0).astype(np.uint8)
-                            ovl_path = mask_path.parent / f"{mask_path.stem}_overlay.png"
-                            if ovl_path.exists():
+                            # look for overlay: same stem + _overlay.png, or in overlays/ folder
+                            ovl_candidates = [
+                                mask_path.parent / f"{mask_path.stem}_overlay.png",
+                                Path(out_dir.strip()) / stem / "overlays" / "000000.png",
+                            ]
+                            ovl_path = next((o for o in ovl_candidates if o.exists()), None)
+                            if ovl_path:
+                                print(f"[_load] found overlay: {ovl_path}")
                                 existing_colored = existing_pvs_ov = Image.open(ovl_path).convert("RGB")
                             else:
+                                print(f"[_load] no overlay found, generating from mask")
                                 existing_colored = apply_mask_overlay(pil, existing_mask, opacity=0.55)
                                 existing_pvs_ov  = apply_mask_overlay(pil, existing_mask, opacity=0.5)
                             existing_bw = _bw_preview(existing_mask)
-                            status += f"  ✅ Existing mask loaded."
+                            status += f"  ✅ Cached mask loaded ({mask_path.name}) — run Auto Detect (PCS) to start a new session."
                         except Exception as e:
+                            print(f"[_load] mask load error: {e}")
                             status += f"  ⚠️ Mask load failed: {e}"
-                return (pil, pil, is_vid, full_path, status, tab3_vis,
+                    else:
+                        print(f"[_load] no cached mask found for stem={stem!r} in {out_dir!r}")
+                print(f"[_load] returning: existing_mask={'yes' if existing_mask is not None else 'no'}")
+                # Use overlay as the loaded preview when cache exists, else raw frame
+                preview_img = existing_pvs_ov if existing_pvs_ov is not None else pil
+                print(f"[_load] preview_img source={'cached overlay' if existing_pvs_ov is not None else 'raw frame'}")
+                return (preview_img, pil, is_vid, full_path, status, tab3_vis,
                         existing_mask, existing_mask, existing_mask,
                         [], [], [],
                         existing_colored, existing_pvs_ov, existing_bw,
-                        existing_bw, filename, fps_update)
+                        existing_bw, filename, fps_update,
+                        None, [], None)  # always clear session on fresh load
 
             me_load_btn.click(
                 fn=_load, inputs=[me_folder, me_file_dd, st_out_dir],
                 outputs=[
                     me_loaded_preview, st_me_img, st_is_video, st_vid_path, me_load_status,
-                    tab_video_prop := gr.Tab("Video Propagator", visible=False),
-                    st_me_auto, st_me_mask, st_shared_mask := gr.State(None),
+                    tab_video_prop,
+                    st_me_auto, st_me_mask, st_shared_mask,
                     st_me_hist, st_me_pts, st_me_modes,
                     me_colored, me_pvs_overlay, me_mask_bw,
                     vp_keyframe_preview, st_last_file, vp_target_fps,
+                    st_session_id, st_vid_frames, st_temp_dir,
                 ],
             )
             me_load_btn.click(fn=lambda f: _save_config("last_file", f), inputs=[me_file_dd], outputs=[])
@@ -1566,22 +1772,46 @@ Propagates **all detected objects** from Tab 2's active session across all video
 - `summary.json`
 """)
             with gr.Row():
-                with gr.Column(scale=1):
-                    vp_video_info = gr.Textbox(label="Video (from Tab 2)", interactive=False)
-                    vp_keyframe_preview.visible = True
-                    vp_framelim.visible = True
-                    vp_target_fps.visible = True
-                    vp_btn = gr.Button("🚀 Propagate Video", variant="primary")
                 with gr.Column(scale=4):
                     vp_video_out = gr.Video(label="Overlay Video", height=430)
                     vp_log       = gr.Textbox(label="Propagation Log", lines=14, interactive=False)
+            with gr.Row():
+                vp_video_info = gr.Textbox(label="Video (from Tab 2)", interactive=False, scale=3)
+            with gr.Row():
+                with gr.Column(scale=1):
+                    vp_keyframe_preview  # renders here (already declared visible=False, toggled by _load)
+                    vp_framelim_tab3  = gr.Slider(0, 2000, value=_startup_frame_limit, step=10,
+                                                   label="Frame Limit (0 = all frames)")
+                    vp_target_fps_tab3 = gr.Slider(0, 30, value=_startup_target_fps, step=1,
+                                                   label="Target FPS (0 = source FPS)")
+            with gr.Row():
+                vp_btn = gr.Button("🚀 Propagate Video", variant="primary")
 
-            vp_target_fps.release(fn=lambda v: v, inputs=[vp_target_fps], outputs=[gr.State()])
+            vp_target_fps.release(
+                fn=lambda v: (_save_config("target_fps", int(v)) or int(v)),
+                inputs=[vp_target_fps], outputs=[vp_target_fps]
+            )
+            vp_framelim.release(
+                fn=lambda v: (_save_config("frame_limit", int(v)) or int(v)),
+                inputs=[vp_framelim], outputs=[vp_framelim]
+            )
+            # Tab 3 slider save-to-config and sync back to hidden Tab 2 states
+            vp_target_fps_tab3.release(
+                fn=lambda v: (_save_config("target_fps", int(v)) or int(v)),
+                inputs=[vp_target_fps_tab3], outputs=[vp_target_fps_tab3]
+            )
+            vp_framelim_tab3.release(
+                fn=lambda v: (_save_config("frame_limit", int(v)) or int(v)),
+                inputs=[vp_framelim_tab3], outputs=[vp_framelim_tab3]
+            )
 
             def _propagate(session_id, frames, temp_dir, vid_path, out_dir, out_fps, min_px,
                            prompt, prompt_history, target_fps, frame_limit):
                 vid_display = vid_path or "(none loaded)"
+                print(f"[_propagate] session_id={session_id!r} n_frames={len(frames) if frames else 0} "
+                      f"vid_path={vid_path!r} out_fps={out_fps} target_fps={target_fps}")
                 if not session_id:
+                    print("[_propagate] ❌ no session_id — aborting")
                     yield vid_display, None, None, "❌ No session. Run Auto Detect (PCS) in Tab 2."
                     return
                 yield vid_display, None, None, "⏳ Starting propagation …"
@@ -1597,7 +1827,7 @@ Propagates **all detected objects** from Tab 2's active session across all video
                 fn=_propagate,
                 inputs=[st_session_id, st_vid_frames, st_temp_dir, st_vid_path,
                         st_out_dir, st_out_fps, shared_min_px,
-                        me_prompt, st_prompt_hist, vp_target_fps, vp_framelim],
+                        me_prompt, st_prompt_hist, vp_target_fps_tab3, vp_framelim_tab3],
                 outputs=[vp_video_info, vp_keyframe_preview, vp_video_out, vp_log],
             )
 
