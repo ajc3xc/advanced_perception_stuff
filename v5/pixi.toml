@@ -1,0 +1,46 @@
+[workspace]
+channels = ["pytorch", "nvidia", "conda-forge"]
+channel-priority = "disabled"
+name = "sam31_v5"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[system-requirements]
+cuda = "12.8"
+
+[tasks]
+app = "python app_v5.py"
+
+[dependencies]
+# Same deps as v4 EXCEPT sam3 removed — installed via pypi from official GitHub
+python          = "3.12.*"
+pip             = ">=26.0.1,<27"
+pytorch-gpu     = ">=2.7,<3"
+torchvision     = ">=0.22,<1"
+cuda-version    = "12.8.*"
+pillow          = ">=11.3.0,<13"
+setuptools      = "<80"
+numpy           = "*"
+matplotlib      = "*"
+huggingface_hub = ">=1.5.0,<2"
+iopath          = ">=0.1.10,<0.2"
+einops          = ">=0.8.2,<0.9"
+pycocotools     = ">=2.0.11,<3"
+psutil          = ">=7.2.2,<8"
+ftfy            = ">=6.3.1,<7"
+sentencepiece   = ">=0.2.1,<0.3"
+imageio         = ">=2.37.0,<3"
+py-opencv       = "*"
+gradio          = ">=5.0,<7"
+accelerate      = ">=1.13.0,<2"
+peft            = ">=0.18.1,<0.19"
+transformers    = "*"
+ffmpeg          = ">=7.0,<8"
+pytz            = ">=2026.1.post1,<2027"
+scikit-image    = ">=0.26.0,<0.27"
+scikit-learn    = ">=1.8.0,<2"
+ninja           = "*"
+
+[pypi-dependencies]
+# Official facebookresearch/sam3 — includes Object Multiplex (SAM3.1 inference)
+sam3 = { git = "https://github.com/facebookresearch/sam3.git" }

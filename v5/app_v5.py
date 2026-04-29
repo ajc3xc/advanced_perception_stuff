@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """
-SAM3 Bamboo Annotation Tool — app_v4.py
+SAM3.1 Bamboo Annotation Tool — app_v5.py
+
+Identical to app_v4.py EXCEPT:
+  - MODEL_REPO defaults to "jetjodh/sam3.1"  (Object Multiplex checkpoint)
+  - sam3 package installed from facebookresearch/sam3 GitHub (has Object Multiplex code)
+  - secret_token.txt read from parent directory (../secret_token.txt)
+
+Object Multiplex (SAM3.1) processes all tracked objects jointly instead of one
+at a time, giving ~7x speedup at 128 objects vs the November 2025 SAM3 release.
+This directly fixes the VRAM death spiral (0x119 BSOD) seen with 50+ bamboo objects.
 
 Tab 1 — Image Segmentation   : native SAM3 image predictor, PCS demo, self-contained
 Tab 2 — Mask Editor          : image mode (PCS+PVS stateless) OR video mode
@@ -73,17 +82,13 @@ MAX_VID_HIST  = 10    # max undo steps for video session
 MAX_IMG_HIST  = 10    # max undo steps for image mask editor
 DEFAULT_INPUT_DIR  = "/blue/cli2/a.camerer/ABE6399_Robotics/inputs/lr_videos_left/"
 DEFAULT_OUTPUT_DIR = "/blue/cli2/a.camerer/ABE6399_Robotics/outputs/video/"
-# override defaults from saved config if present (set when user changes folders)
 def _get_saved_input_dir():
     return _load_config().get("input_dir", DEFAULT_INPUT_DIR)
 def _get_saved_output_dir():
     return _load_config().get("output_dir", DEFAULT_OUTPUT_DIR)
 DEFAULT_PROMPT     = os.environ.get("SAM3_DEFAULT_PROMPT", "bamboo")
-MODEL_REPO         = os.environ.get("SAM3_MODEL_REPO",    "jetjodh/sam3")
-# Local checkpoint path for native SAM3 predictor.
-# If SAM3_CHECKPOINT_PATH is set, use that directly (no download).
-# Otherwise the startup code will download sam3.pt + BPE from MODEL_REPO via
-# huggingface_hub (no gated-access required when using jetjodh/sam3 mirror).
+# ── v5 change: default to jetjodh/sam3.1 (Object Multiplex checkpoint) ───────
+MODEL_REPO         = os.environ.get("SAM3_MODEL_REPO",    "jetjodh/sam3.1")
 SAM3_CHECKPOINT_PATH = os.environ.get("SAM3_CHECKPOINT_PATH", "")
 CONFIG_PATH        = Path(DEFAULT_OUTPUT_DIR) / ".sam3_ui_config.json"
 
@@ -106,23 +111,12 @@ def _save_config(key: str, value):
 
 
 def _norm_path(p: str) -> str:
-    """
-    Normalise a folder path pasted from any OS into a clean forward-slash string.
-    Handles:
-      - surrounding quotes (single or double, e.g. pasted from Windows Explorer)
-      - backslashes  (Windows paths)
-      - mixed slashes
-      - leading/trailing whitespace
-    """
     if not p:
         return p
     p = p.strip()
-    # strip wrapping quotes — Explorer sometimes wraps in double quotes
     if len(p) >= 2 and p[0] in ('"', "'") and p[-1] == p[0]:
         p = p[1:-1].strip()
-    # normalise backslashes to forward slashes
     p = p.replace("\\", "/").replace("\\", "/")
-    # remove any trailing slash for consistency
     p = p.rstrip("/")
     return p
 
@@ -130,42 +124,33 @@ def _norm_path(p: str) -> str:
 def _resolve_sam3_checkpoint() -> tuple[str | None, str | None]:
     """
     Return (checkpoint_path, bpe_path) for build_sam3_video_predictor.
-
-    Priority:
-      1. SAM3_CHECKPOINT_PATH env-var — use as-is (user pre-downloaded).
-      2. Cached copy already on disk from a previous run.
-      3. Download sam3.pt + BPE vocab from MODEL_REPO via huggingface_hub
-         (works with jetjodh/sam3 which has no gated-access requirement).
-
-    Returns (None, None) if everything fails, in which case the caller falls
-    back to load_from_HF=True so behaviour is identical to the old code.
+    Priority: SAM3_CHECKPOINT_PATH env-var → HF hub download from MODEL_REPO.
+    jetjodh/sam3.1 is ungated so no token required.
     """
-    # ── 1. explicit override ──────────────────────────────────────────────────
     if SAM3_CHECKPOINT_PATH:
         ckpt = Path(SAM3_CHECKPOINT_PATH)
         if ckpt.exists():
             print(f"[_resolve_sam3_checkpoint] using SAM3_CHECKPOINT_PATH: {ckpt}")
-            return str(ckpt), None   # let the package find its own BPE
+            return str(ckpt), None
         print(f"[_resolve_sam3_checkpoint] SAM3_CHECKPOINT_PATH set but not found: {ckpt}")
 
-    # ── 2 + 3. huggingface_hub download (cached after first run) ─────────────
     try:
         from huggingface_hub import hf_hub_download
         cache_dir = Path.home() / ".cache" / "sam3_local"
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # load HF token from secret_token.txt if present, else env var, else none
         hf_token = os.environ.get("HF_TOKEN") or None
-        token_file = Path(__file__).parent / "secret_token.txt"
+        # ── v5 change: token file is one level up (../secret_token.txt) ───────
+        token_file = Path(__file__).parent.parent / "secret_token.txt"
         if not hf_token and token_file.exists():
             try:
                 hf_token = token_file.read_text().strip() or None
                 if hf_token:
-                    print(f"[_resolve_sam3_checkpoint] HF token loaded from secret_token.txt")
+                    print(f"[_resolve_sam3_checkpoint] HF token loaded from {token_file}")
             except Exception:
                 pass
         if not hf_token:
-            print(f"[_resolve_sam3_checkpoint] no HF token found — downloads may be slow")
+            print(f"[_resolve_sam3_checkpoint] no HF token — jetjodh/sam3.1 is ungated, should be fine")
 
         print(f"[_resolve_sam3_checkpoint] downloading sam3.pt from {MODEL_REPO} …")
         ckpt_path = hf_hub_download(
@@ -176,7 +161,6 @@ def _resolve_sam3_checkpoint() -> tuple[str | None, str | None]:
         )
         print(f"[_resolve_sam3_checkpoint] checkpoint → {ckpt_path}")
 
-        # BPE vocab — try the repo first, fall back to the package's bundled copy
         bpe_path = None
         try:
             bpe_path = hf_hub_download(
@@ -186,8 +170,7 @@ def _resolve_sam3_checkpoint() -> tuple[str | None, str | None]:
             )
             print(f"[_resolve_sam3_checkpoint] BPE vocab → {bpe_path}")
         except Exception as bpe_err:
-            print(f"[_resolve_sam3_checkpoint] BPE not in repo ({bpe_err}), "
-                  "package will use its bundled copy")
+            print(f"[_resolve_sam3_checkpoint] BPE not in repo ({bpe_err}), package will use bundled copy")
 
         return str(ckpt_path), bpe_path
 
@@ -240,7 +223,6 @@ app_theme = CustomBlueTheme()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"🖥️  device={device}  {_mem()}")
 
-# global video predictor — stateful, kept alive across sessions
 VID_PREDICTOR = None
 IMG_MODEL     = None
 IMG_PROCESSOR = None
@@ -248,17 +230,15 @@ TRK_MODEL     = None
 TRK_PROCESSOR = None
 
 # ── set HF_TOKEN before any HuggingFace downloads ────────────────────────────
-_token_file = Path(__file__).parent / "secret_token.txt"
+# ── v5 change: secret_token.txt is one level up ──────────────────────────────
+_token_file = Path(__file__).parent.parent / "secret_token.txt"
 if _token_file.exists() and "HF_TOKEN" not in os.environ:
     _tok = _token_file.read_text().strip()
     if _tok:
         os.environ["HF_TOKEN"] = _tok
-        print(f"[models] HF_TOKEN set from secret_token.txt")
+        print(f"[models] HF_TOKEN set from {_token_file}")
 
 # ── load transformers image models FIRST (while RAM is low) ──────────────────
-# Loading order matters: transformers downloads ~500MB when cache is cold.
-# With VID_PREDICTOR loaded first, RAM is already 5.5GB leaving no headroom
-# for the download buffer — process gets killed by the OS at C level.
 try:
     if _TRANSFORMERS:
         print("⏳  Loading transformers image models …")
@@ -276,15 +256,14 @@ except BaseException as e:
     print(f"❌  Image model load failed: {type(e).__name__}: {e}", flush=True)
     traceback.print_exc()
 
-# ── load native SAM3 video predictor AFTER transformers (cache is warm) ──────
+# ── load native SAM3.1 video predictor ───────────────────────────────────────
 _available_gb = psutil.virtual_memory().available / 1e9
 if _available_gb < 3.0:
     print(f"⚠️  Low RAM warning: only {_available_gb:.1f}GB available before loading SAM3 predictor.")
-    print(f"   SAM3 needs ~4-5GB RAM. Close other apps if loading fails.")
 
 try:
     if _SAM3_NATIVE:
-        print("⏳  Loading native SAM3 video predictor …")
+        print("⏳  Loading native SAM3.1 video predictor (Object Multiplex) …")
         ckpt_path, bpe_path = _resolve_sam3_checkpoint()
         if ckpt_path:
             print(f"[VID_PREDICTOR] load_from_HF=False  ckpt={ckpt_path}")
@@ -305,10 +284,7 @@ except Exception as e:
     print(f"❌  VID_PREDICTOR load failed: {e}")
 
 # ── Blanket BFloat16 fix: hook every Conv2d in the video predictor ─────────────
-# The SAM3 backbone runs in BFloat16 but many conv weight/bias tensors stay
-# float32 on Windows (no Triton autocast kernel). Rather than patching each
-# file individually we register a single forward pre-hook on every Conv2d
-# layer that silently casts the input to match the weight dtype.
+# May still be needed on Windows even with the new package.
 if VID_PREDICTOR is not None:
     def _conv_dtype_hook(module, args):
         x = args[0]
@@ -322,7 +298,7 @@ if VID_PREDICTOR is not None:
     print(f"[dtype-hooks] Conv2d input-cast hooks registered on VID_PREDICTOR")
 
 # ═════════════════════════════════════════════════════════════════════════════
-# SHARED UTILS  (model-agnostic, identical to v3)
+# SHARED UTILS
 # ═════════════════════════════════════════════════════════════════════════════
 def apply_mask_overlay(base_image, mask_data, opacity: float = 0.5):
     """Rainbow per-instance overlay. mask_data: (H,W) or (N,H,W)."""
@@ -381,7 +357,6 @@ def _normalize_prompt(text_query, default: str = DEFAULT_PROMPT) -> str:
 
 
 def remove_small_regions(mask_np: np.ndarray, min_px: int) -> np.ndarray:
-    """Remove connected components < min_px pixels. Applied to output masks only."""
     if mask_np is None or min_px <= 0: return mask_np
     m = (mask_np > 0).astype(np.uint8)
     if m.sum() == 0: return m
@@ -418,17 +393,7 @@ def union_instance_masks(results) -> np.ndarray | None:
     return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Native SAM3 output → numpy masks
-# ─────────────────────────────────────────────────────────────────────────────
 def _parse_native_outputs(outputs, vid_h: int, vid_w: int):
-    """
-    Parse native SAM3 handle_request outputs into a list of (obj_id, mask_np) tuples.
-    Handles three possible output formats:
-      A) {"out_obj_ids": ndarray, "out_binary_masks": ndarray, ...}  — text PCS format
-      B) {obj_id (int): mask_tensor}                                  — point/build_outputs format
-      C) prepare_masks_for_visualization already processed result     — {obj_id: binary_mask}
-    """
     results = []
     if outputs is None:
         return results
@@ -445,7 +410,6 @@ def _parse_native_outputs(outputs, vid_h: int, vid_w: int):
         results.append((int(obj_id), (mask > 0).astype(np.uint8)))
 
     try:
-        # ── Format A: text PCS output with named keys ─────────────────
         if isinstance(outputs, dict) and "out_obj_ids" in outputs:
             ids   = outputs["out_obj_ids"]
             masks = outputs["out_binary_masks"]
@@ -455,7 +419,6 @@ def _parse_native_outputs(outputs, vid_h: int, vid_w: int):
             if results:
                 return results
 
-        # ── Format B: integer-keyed dict {obj_id: mask_tensor} ────────
         if isinstance(outputs, dict) and outputs and all(
             isinstance(k, (int, np.integer)) for k in outputs.keys()
         ):
@@ -464,7 +427,6 @@ def _parse_native_outputs(outputs, vid_h: int, vid_w: int):
             if results:
                 return results
 
-        # ── Format C: prepare_masks_for_visualization path ────────────
         fmt = prepare_masks_for_visualization({0: outputs})
         for obj_id, mask in fmt.get(0, {}).items():
             _add(obj_id, mask)
@@ -475,20 +437,13 @@ def _parse_native_outputs(outputs, vid_h: int, vid_w: int):
 
 
 def _render_native_outputs(frame_pil: Image.Image, obj_masks: list) -> Image.Image:
-    """
-    Render a list of (obj_id, mask) onto frame_pil with rainbow per-object colors.
-    """
     if not obj_masks:
         return frame_pil
-    stack = np.stack([m for _, m in obj_masks], axis=0)  # (N, H, W)
+    stack = np.stack([m for _, m in obj_masks], axis=0)
     return apply_mask_overlay(frame_pil, stack, opacity=0.55)
 
 
 def _build_label_map(obj_masks: list, shape_hw: tuple) -> np.ndarray:
-    """
-    Build instance label map: pixel = obj_id (1..N), 0 = background.
-    obj_masks: list of (obj_id, mask_np).
-    """
     label_map = np.zeros(shape_hw, dtype=np.uint8)
     for obj_id, mask in obj_masks:
         capped = min(int(obj_id), 255)
@@ -497,7 +452,7 @@ def _build_label_map(obj_masks: list, shape_hw: tuple) -> np.ndarray:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 1 — image segmentation (transformers, self-contained)
+# TAB 1 — image segmentation
 # ═════════════════════════════════════════════════════════════════════════════
 def run_image_segmentation(source_img, text_query, conf_thresh: float = 0.5):
     print(f"[run_image_segmentation] START prompt='{text_query}' {_mem()}")
@@ -526,10 +481,9 @@ def run_image_segmentation(source_img, text_query, conf_thresh: float = 0.5):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 2 — image mode (transformers PCS + PVS, stateless)
+# TAB 2 — image mode
 # ═════════════════════════════════════════════════════════════════════════════
 def run_pcs_dual(source_img, text_query, conf_thresh: float = 0.5):
-    """PCS on a static image. Returns (pil, colored_overlay, binary, inst_masks_np)."""
     print(f"[run_pcs_dual] START prompt='{text_query}' conf={conf_thresh} {_mem()}")
     if IMG_MODEL is None or IMG_PROCESSOR is None:
         raise gr.Error("Image model not loaded.")
@@ -561,7 +515,6 @@ def run_pcs_dual(source_img, text_query, conf_thresh: float = 0.5):
 
 
 def tracker_single_click_mask(image_pil: Image.Image, x: int, y: int):
-    """PVS single click on static image. Returns binary mask (H,W)."""
     print(f"[tracker_single_click_mask] click=({x},{y}) {_mem()}")
     if TRK_MODEL is None or TRK_PROCESSOR is None:
         raise gr.Error("Tracker model not loaded.")
@@ -593,9 +546,6 @@ def tracker_single_click_mask(image_pil: Image.Image, x: int, y: int):
     return (click_mask > 0).astype(np.uint8)
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# TAB 2 — image mask editor helpers (unchanged from v3)
-# ═════════════════════════════════════════════════════════════════════════════
 def _push_img_history(hist, mask, pts, modes):
     hist = list(hist or [])
     hist.append((mask.copy(), list(pts), list(modes)))
@@ -603,7 +553,6 @@ def _push_img_history(hist, mask, pts, modes):
 
 
 def mask_editor_click_image(evt: gr.SelectData, st_img, st_mask, st_mode, st_hist, st_pts, st_modes):
-    """Image mode PVS click handler."""
     if st_img is None or st_mask is None:
         return None, None, st_hist, st_pts, st_modes, "⚠️ Run Auto Detect (PCS) first."
     x, y = evt.index
@@ -634,31 +583,14 @@ def mask_editor_click_image(evt: gr.SelectData, st_img, st_mask, st_mode, st_his
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 2 — video mode: native SAM3 predictor helpers
+# TAB 2 — video mode helpers
 # ═════════════════════════════════════════════════════════════════════════════
 def vid_start_session(video_path_str: str, prompt: str, conf: float,
                       target_fps: float, frame_limit: int):
-    """
-    Phase 1 — fast keyframe editing.
-
-    Only frame 0 is extracted and passed to the native SAM3 predictor so the
-    session starts instantly (no waiting for 2000+ frames to load).  The full
-    frame list is NOT extracted here; that happens lazily in
-    vid_expand_session_for_propagation() when the user clicks Propagate.
-
-    Returns (session_id, temp_dir, frames_list, frame0_overlay_pil,
-             n_obj, status_str, out_fps, vid_h, vid_w).
-
-    temp_dir contains only 00000.jpg (frame 0) at this stage.
-    frames_list contains only frames[0] as a numpy RGB array.
-    """
     print(f"[vid_start_session] START path={video_path_str} {_mem()}")
     if VID_PREDICTOR is None:
         return None, None, [], None, 0, "❌ VID_PREDICTOR not loaded.", 0.0, 0, 0
 
-    # Wire the UI confidence slider into the native predictor's detection thresholds.
-    # The model defaults are score_threshold_detection=0.5, new_det_thresh=0.7 which
-    # are too strict for real-world footage. Apply the user's conf value here.
     try:
         VID_PREDICTOR.model.score_threshold_detection = float(conf)
         VID_PREDICTOR.model.new_det_thresh = float(conf)
@@ -666,7 +598,6 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
     except Exception as _e:
         print(f"[vid_start_session] could not set detection thresholds: {_e}")
 
-    # ── read video metadata + frame 0 only ───────────────────────────────
     cap     = cv2.VideoCapture(video_path_str)
     fps     = cap.get(cv2.CAP_PROP_FPS) or 25.0
     vid_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -682,12 +613,6 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
 
     frame0_rgb = cv2.cvtColor(frame0_bgr, cv2.COLOR_BGR2RGB)
 
-    # ── extract a small keyframe window so SAM3 text grounding works ────────
-    # SAM3 needs multiple frames loaded to run PCS text prompts — 1-frame
-    # sessions return empty outputs.  We extract up to N_KEYFRAME_FRAMES
-    # frames here so the session initialises properly, then expand to the
-    # full video at propagation time.
-    # Use up to 50 keyframes, or the full video if it has fewer.
     _total_src_frames = int(cv2.VideoCapture(video_path_str).get(cv2.CAP_PROP_FRAME_COUNT))
     _total_at_fps     = max(1, _total_src_frames // max(step, 1))
     N_KEYFRAME_FRAMES = min(50, _total_at_fps)
@@ -711,7 +636,6 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
     cap2.release()
     print(f"[vid_start_session] keyframe window: {len(frames_for_session)} frames → {temp_dir}")
 
-    # ── start session on the keyframe window ─────────────────────────────
     try:
         resp       = VID_PREDICTOR.handle_request(dict(type="start_session", resource_path=temp_dir))
         session_id = resp["session_id"]
@@ -720,7 +644,6 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
         shutil.rmtree(temp_dir, ignore_errors=True)
         return None, None, [], None, 0, f"❌ start_session failed: {e}", out_fps, vid_h, vid_w
 
-    # ── initial PCS text prompt on frame 0 ───────────────────────────────
     prompt = _normalize_prompt(prompt)
     try:
         resp      = VID_PREDICTOR.handle_request(dict(
@@ -741,34 +664,16 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
         obj_masks  = []
         n_obj      = 0
 
-    # frames list holds only frame 0 for now; propagation will repopulate it
     return session_id, temp_dir, [frame0_rgb], overlay, obj_masks, n_obj, status, out_fps, vid_h, vid_w
 
 
 def vid_expand_session_for_propagation(
-    session_id: str,
-    temp_dir: str,
-    video_path_str: str,
-    target_fps: float,
-    frame_limit: int,
-    prompt: str,
-    prompt_history: list,
-    vid_h: int,
-    vid_w: int,
+    session_id: str, temp_dir: str, video_path_str: str,
+    target_fps: float, frame_limit: int, prompt: str,
+    prompt_history: list, vid_h: int, vid_w: int,
 ):
-    """
-    Phase 2 — called at the start of run_video_propagation.
-
-    Extracts ALL frames at target_fps, writes them into the existing temp_dir
-    (which already has 00000.jpg), resets the session, and replays the full
-    prompt history so the predictor is ready to propagate.
-
-    Returns (frames_list, status_str) where frames_list is the complete
-    list of np.ndarray RGB frames.
-    """
     print(f"[vid_expand_session] START  {_mem()}")
 
-    # Re-apply detection thresholds (they may have been changed since session start)
     try:
         VID_PREDICTOR.model.score_threshold_detection = float(
             getattr(VID_PREDICTOR.model, "score_threshold_detection", 0.5)
@@ -776,7 +681,6 @@ def vid_expand_session_for_propagation(
     except Exception:
         pass
 
-    # ── extract all frames ────────────────────────────────────────────────
     cap     = cv2.VideoCapture(video_path_str)
     fps     = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -795,7 +699,7 @@ def vid_expand_session_for_propagation(
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frames.append(rgb)
             fname = Path(temp_dir) / f"{len(frames)-1:05d}.jpg"
-            if not fname.exists():          # 00000.jpg already there
+            if not fname.exists():
                 cv2.imwrite(str(fname), frame)
         else:
             ret = cap.grab()
@@ -806,24 +710,17 @@ def vid_expand_session_for_propagation(
     print(f"[vid_expand_session] extracted {n} frames → {temp_dir}  {_mem()}")
 
     if n == 0:
-        return [], "❌ No frames extracted during expansion."
+        return [], session_id, "❌ No frames extracted during expansion."
 
-    # ── start a FRESH session on the now-complete folder ────────────────
-    # We cannot reset_session — SAM3 loaded the original 30 keyframes into
-    # memory at start_session time and won't re-scan after reset.  Resetting
-    # then propagating 200 frames crashes when frame index > 30.
-    # Starting a new session forces SAM3 to load all N frames.
     try:
         resp = VID_PREDICTOR.handle_request(dict(
             type="start_session", resource_path=temp_dir))
         new_sid = resp["session_id"]
         print(f"[vid_expand_session] new session {new_sid} on {n} frames  {_mem()}")
-        # base PCS on frame 0
         VID_PREDICTOR.handle_request(dict(
             type="add_prompt", session_id=new_sid, frame_index=0,
             text=_normalize_prompt(prompt),
         ))
-        # replay manual refinements
         skipped = 0
         for entry in (prompt_history or []):
             reqs = entry.get("reqs", [entry]) if isinstance(entry, dict) and "reqs" in entry else [entry]
@@ -837,7 +734,7 @@ def vid_expand_session_for_propagation(
                     print(f"[vid_expand_session] skipped replay {req_copy.get('type')} "
                           f"obj_id={req_copy.get('obj_id','?')}: {replay_e}")
         if skipped:
-            print(f"[vid_expand_session] {skipped} replay entries skipped (obj_id mismatch after re-detection)")
+            print(f"[vid_expand_session] {skipped} replay entries skipped (obj_id mismatch)")
         print(f"[vid_expand_session] replayed ({len(prompt_history or [])} prompts, {skipped} skipped)  {_mem()}")
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -856,8 +753,6 @@ def vid_add_point(session_id: str, frames: list, vid_h: int, vid_w: int,
         rel_y = y / H
         points_tensor = torch.tensor([[rel_x, rel_y]], dtype=torch.float32)
         labels_tensor = torch.tensor([label], dtype=torch.int32)
-        # SAM3 requires obj_id when using point prompts.
-        # Auto-assign a fresh id beyond any currently tracked ones.
         if obj_id is None:
             try:
                 state = VID_PREDICTOR._ALL_INFERENCE_STATES.get(session_id, {})
@@ -868,12 +763,8 @@ def vid_add_point(session_id: str, frames: list, vid_h: int, vid_w: int,
             except Exception:
                 obj_id = 1000
         req = dict(
-            type="add_prompt",
-            session_id=session_id,
-            frame_index=0,
-            points=points_tensor,
-            point_labels=labels_tensor,
-            obj_id=obj_id,
+            type="add_prompt", session_id=session_id, frame_index=0,
+            points=points_tensor, point_labels=labels_tensor, obj_id=obj_id,
         )
         resp      = VID_PREDICTOR.handle_request(req)
         out0      = resp.get("outputs", {})
@@ -881,10 +772,9 @@ def vid_add_point(session_id: str, frames: list, vid_h: int, vid_w: int,
         frame0_pil = Image.fromarray(frames[0])
         overlay    = _render_native_outputs(frame0_pil, obj_masks)
         lbl_str    = "+" if label == 1 else "-"
-        if obj_masks:
-            status = f"✅ Point {lbl_str} at ({x},{y}) — {len(obj_masks)} objects visible"
-        else:
-            status = f"✅ Point {lbl_str} registered at ({x},{y}) — will appear after Propagate"
+        status = (f"✅ Point {lbl_str} at ({x},{y}) — {len(obj_masks)} objects visible"
+                  if obj_masks else
+                  f"✅ Point {lbl_str} registered at ({x},{y}) — will appear after Propagate")
         print(f"[vid_add_point] {status}")
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -895,16 +785,12 @@ def vid_add_point(session_id: str, frames: list, vid_h: int, vid_w: int,
 
 
 def vid_remove_object(session_id: str, frames: list, vid_h: int, vid_w: int, obj_id: int):
-    """Remove an object from the session by ID."""
     if VID_PREDICTOR is None or session_id is None:
         return None, [], "❌ No active session."
     try:
         VID_PREDICTOR.handle_request(dict(type="remove_object", session_id=session_id, obj_id=obj_id))
-        print(f"[vid_remove_object] removing obj_id={obj_id}")
-        # get updated frame 0 state
         resp = VID_PREDICTOR.handle_request(dict(
-            type="add_prompt", session_id=session_id, frame_index=0,
-            text="bamboo",  # re-query to get current state — won't add new objects
+            type="add_prompt", session_id=session_id, frame_index=0, text="bamboo",
         ))
         out0      = resp.get("outputs", {})
         obj_masks = _parse_native_outputs(out0, vid_h, vid_w)
@@ -919,7 +805,6 @@ def vid_remove_object(session_id: str, frames: list, vid_h: int, vid_w: int, obj
 
 
 def vid_reset_to_pcs(session_id: str, frames: list, vid_h: int, vid_w: int, prompt: str):
-    """Reset session to just the initial PCS text prompt, clearing all manual refinements."""
     if VID_PREDICTOR is None or session_id is None:
         return None, [], "❌ No active session."
     try:
@@ -940,50 +825,8 @@ def vid_reset_to_pcs(session_id: str, frames: list, vid_h: int, vid_w: int, prom
     return overlay, obj_masks, status
 
 
-def vid_undo(session_id: str, frames: list, vid_h: int, vid_w: int,
-             prompt: str, prompt_history: list):
-    """
-    Undo last refinement by reset + replay all history except last entry.
-    prompt_history: list of handle_request dicts (excluding initial text prompt).
-    """
-    if VID_PREDICTOR is None or session_id is None:
-        return None, [], prompt_history, "❌ No active session."
-    if not prompt_history:
-        return vid_reset_to_pcs(session_id, frames, vid_h, vid_w, prompt) + (prompt_history,)
-
-    new_history = prompt_history[:-1]
-    try:
-        VID_PREDICTOR.handle_request(dict(type="reset_session", session_id=session_id))
-        # replay base PCS
-        VID_PREDICTOR.handle_request(dict(
-            type="add_prompt", session_id=session_id, frame_index=0,
-            text=_normalize_prompt(prompt),
-        ))
-        # replay remaining history
-        for req in new_history:
-            req_copy = dict(req)
-            req_copy["session_id"] = session_id
-            VID_PREDICTOR.handle_request(req_copy)
-        # get current state
-        resp = VID_PREDICTOR.handle_request(dict(
-            type="add_prompt", session_id=session_id, frame_index=0,
-            text=_normalize_prompt(prompt),
-        ))
-        out0      = resp.get("outputs", {})
-        obj_masks = _parse_native_outputs(out0, vid_h, vid_w)
-        frame0_pil = Image.fromarray(frames[0])
-        overlay    = _render_native_outputs(frame0_pil, obj_masks)
-        status     = f"↩️ Undo — {len(new_history)} step(s) remaining"
-    except Exception as e:
-        overlay   = Image.fromarray(frames[0])
-        obj_masks = []
-        status    = f"❌ undo failed: {e}"
-        new_history = prompt_history
-    return overlay, obj_masks, new_history, status
-
-
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 2 — save mask (works for both image and video mode)
+# TAB 2 — save mask
 # ═════════════════════════════════════════════════════════════════════════════
 def save_mask_with_meta(
     mask_np, inst_masks, pil_img, source_path_str, out_root_str,
@@ -1007,13 +850,10 @@ def save_mask_with_meta(
     json_path = out_dir / f"{fname}.json"
     m = (mask_np > 0).astype(np.uint8)
 
-    # instance label map
     if inst_masks is not None and len(inst_masks) > 0:
         if isinstance(inst_masks, list) and isinstance(inst_masks[0], tuple):
-            # list of (obj_id, mask) from native API
             label_map = _build_label_map(inst_masks, m.shape)
         else:
-            # ndarray (N,H,W) from transformers
             inst_np   = np.asarray(inst_masks)
             if inst_np.ndim == 4: inst_np = inst_np[0]
             label_map = np.zeros(m.shape, dtype=np.uint8)
@@ -1026,7 +866,6 @@ def save_mask_with_meta(
         Image.fromarray(m * 255).save(png_path)
         np.save(npy_path, m)
 
-    # multicolor overlay
     if inst_masks is not None and pil_img is not None:
         try:
             src_pil = pil_img.convert("RGB")
@@ -1055,7 +894,7 @@ def save_mask_with_meta(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 2/3 — file utilities (unchanged from v3)
+# File utilities
 # ═════════════════════════════════════════════════════════════════════════════
 def list_folder_media(folder_path_str: str) -> list[str]:
     folder = Path((folder_path_str or "").strip())
@@ -1095,26 +934,14 @@ def load_media_file(folder_path_str: str, filename: str):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 3 — video propagation (native SAM3 multi-object)
+# TAB 3 — video propagation
 # ═════════════════════════════════════════════════════════════════════════════
 def run_video_propagation(
-    session_id: str,
-    frames: list,           # may be just [frame0] if expansion hasn't run yet
-    temp_dir: str,
-    video_path_str: str,
-    out_root_str: str,
-    out_fps: float,
-    min_region_px: int,
-    prompt: str = "",
-    prompt_history: list = None,
-    target_fps: float = 5.0,
-    frame_limit: int = 0,
+    session_id: str, frames: list, temp_dir: str, video_path_str: str,
+    out_root_str: str, out_fps: float, min_region_px: int,
+    prompt: str = "", prompt_history: list = None,
+    target_fps: float = 5.0, frame_limit: int = 0,
 ):
-    """
-    Generator: propagate all objects tracked in Tab 2 across all frames.
-    Yields (mp4_path_or_None, log_str) — mp4 is None until final yield.
-    Saves per-frame label maps, overlays, meta, summary.json, overlay.mp4.
-    """
     print(f"[run_video_propagation] START session={session_id} {_mem()}")
     if VID_PREDICTOR is None:
         raise gr.Error("VID_PREDICTOR not loaded.")
@@ -1136,21 +963,14 @@ def run_video_propagation(
     n      = len(frames)
     vid_h, vid_w = frames[0].shape[:2]
 
-    # ── Phase 2: expand frames if we only have frame 0 (stub session) ────
     if n <= 1:
         yield None, f"⏳ Extracting frames from video …  {_mem()}"
         frames, new_session_id, expand_status = vid_expand_session_for_propagation(
-            session_id=session_id,
-            temp_dir=temp_dir,
-            video_path_str=video_path_str,
-            target_fps=target_fps,
-            frame_limit=frame_limit,
-            prompt=prompt,
-            prompt_history=prompt_history,
-            vid_h=vid_h,
-            vid_w=vid_w,
+            session_id=session_id, temp_dir=temp_dir, video_path_str=video_path_str,
+            target_fps=target_fps, frame_limit=frame_limit, prompt=prompt,
+            prompt_history=prompt_history, vid_h=vid_h, vid_w=vid_w,
         )
-        session_id = new_session_id  # use fresh session for propagation
+        session_id = new_session_id
         n = len(frames)
         print(f"[run_video_propagation] expansion: {expand_status}")
         if n == 0:
@@ -1170,8 +990,7 @@ def run_video_propagation(
 
     try:
         for response in VID_PREDICTOR.handle_stream_request(dict(
-            type="propagate_in_video",
-            session_id=session_id,
+            type="propagate_in_video", session_id=session_id,
         )):
             f_idx     = response.get("frame_index", 0)
             raw_out   = response.get("outputs", {})
@@ -1185,13 +1004,9 @@ def run_video_propagation(
             orig = Image.fromarray(frames[f_idx]) if f_idx < len(frames) else Image.fromarray(frames[-1])
 
             if obj_masks:
-                # build label map
                 label_map = _build_label_map(obj_masks, (vid_h, vid_w))
-                # apply min region filter per object
                 if min_region_px > 0:
-                    for obj_id, mask in obj_masks:
-                        cleaned = remove_small_regions(mask, min_region_px)
-                        obj_masks_clean = [(oid, (remove_small_regions(m, min_region_px))) for oid, m in obj_masks]
+                    obj_masks_clean = [(oid, remove_small_regions(m, min_region_px)) for oid, m in obj_masks]
                     label_map = _build_label_map(obj_masks_clean, (vid_h, vid_w))
                 overlay_frame = _render_native_outputs(orig, obj_masks)
             else:
@@ -1202,14 +1017,11 @@ def run_video_propagation(
             Image.fromarray(label_map).save(mask_dir / f"{fn}.png")
             np.save(mask_dir / f"{fn}.npy", label_map)
             Image.fromarray(np.array(overlay_frame)).save(ovl_dir / f"{fn}.png")
-            frame_meta = {
-                "frame_idx": f_idx,
-                "n_objects": len(obj_masks),
+            (meta_dir / f"{fn}.json").write_text(json.dumps({
+                "frame_idx": f_idx, "n_objects": len(obj_masks),
                 "obj_ids": [int(oid) for oid, _ in obj_masks],
-                "shape_hw": [vid_h, vid_w],
-                "timestamp": datetime.now().isoformat(),
-            }
-            (meta_dir / f"{fn}.json").write_text(json.dumps(frame_meta, indent=2))
+                "shape_hw": [vid_h, vid_w], "timestamp": datetime.now().isoformat(),
+            }, indent=2))
             writer.write(cv2.cvtColor(np.array(overlay_frame), cv2.COLOR_RGB2BGR))
             log_lines.append(f"[{f_idx:05d}/{n}] {len(obj_masks)} obj")
 
@@ -1222,21 +1034,13 @@ def run_video_propagation(
     writer.release()
     shutil.copy2(tmp_mp4, real_mp4)
     dt = time.time() - t0
-
-    summary = {
-        "video_path": str(video_path),
-        "stem": stem,
-        "total_frames": n,
-        "output_fps": out_fps,
-        "runtime_s": round(dt, 2),
-        "output_dir": str(out_dir),
-        "timestamp": datetime.now().isoformat(),
-    }
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
-    log = (
-        f"✅ Done.  {n} frames in {dt:.1f}s\n"
-        f"Output → {out_dir}\n\n"
-    ) + "\n".join(reversed(log_lines[-150:]))
+    (out_dir / "summary.json").write_text(json.dumps({
+        "video_path": str(video_path), "stem": stem, "total_frames": n,
+        "output_fps": out_fps, "runtime_s": round(dt, 2),
+        "output_dir": str(out_dir), "timestamp": datetime.now().isoformat(),
+    }, indent=2))
+    log = (f"✅ Done.  {n} frames in {dt:.1f}s\nOutput → {out_dir}\n\n"
+           ) + "\n".join(reversed(log_lines[-150:]))
     print(f"[run_video_propagation] END {_mem()}")
     yield tmp_mp4, log
 
@@ -1272,25 +1076,22 @@ CTRLZ_JS = r"""
 with gr.Blocks() as demo:
 
     with gr.Column(elem_id="col-container"):
-        gr.Markdown("# **SAM3 v4: Multi-Object Bamboo Annotation**", elem_id="main-title")
+        # ── v5 change: updated title ──────────────────────────────────────────
+        gr.Markdown("# **SAM3.1 v5: Multi-Object Bamboo Annotation** ⚡ Object Multiplex", elem_id="main-title")
         gr.Markdown(
             "**Tab 1**: quick image PCS test · "
             "**Tab 2**: image PCS+PVS OR video multi-object session · "
             "**Tab 3**: video propagation (appears when video session active)"
         )
 
-    # ── shared state ──────────────────────────────────────────────────────────
     _startup_input_dir  = _get_saved_input_dir()
     _startup_output_dir = _get_saved_output_dir()
 
     st_last_input_dir  = gr.State(_startup_input_dir)
     st_last_output_dir = gr.State(_startup_output_dir)
 
-    st_out_dir = gr.Textbox(
-        label="Output Folder (shared)",
-        placeholder="/path/to/output",
-        value=_startup_output_dir,
-    )
+    st_out_dir = gr.Textbox(label="Output Folder (shared)", placeholder="/path/to/output",
+                             value=_startup_output_dir)
     def _on_output_dir_change(v):
         v = _norm_path(v)
         _save_config("output_dir", v)
@@ -1299,72 +1100,57 @@ with gr.Blocks() as demo:
 
     shared_min_px = gr.Slider(0, 2000, value=_load_config().get("min_px", 50), step=10,
                                label="Min Region Size — output mask filter (0 = off)")
-
     st_min_px = gr.State(_load_config().get("min_px", 50))
     def _save_min_px(v):
-        print(f"[shared_min_px] → {v}")
         _save_config("min_px", int(v))
         return int(v)
     shared_min_px.release(fn=_save_min_px, inputs=[shared_min_px], outputs=[st_min_px])
 
-    # video session state — shared Tab 2 → Tab 3
-    st_session_id   = gr.State(None)   # native SAM3 session_id string
-    st_temp_dir     = gr.State(None)   # temp JPEG folder path
-    st_vid_frames   = gr.State([])     # list of np RGB frames
-    st_vid_path     = gr.State(None)   # full video path string
-    st_vid_h        = gr.State(0)
-    st_vid_w        = gr.State(0)
-    st_out_fps      = gr.State(5.0)
-    st_vid_obj_masks= gr.State([])     # current frame0 obj_masks list
-    st_prompt_hist  = gr.State([])     # refinement history for undo (max 10)
-                                       # each entry: {"reqs": [...], "masks": [...]}
-    st_pcs_masks    = gr.State([])     # masks right after PCS — undo baseline
-    st_pending_pts  = gr.State([])     # add-mode points staged for batch submit
-    st_last_file    = gr.State(None)
+    st_session_id    = gr.State(None)
+    st_temp_dir      = gr.State(None)
+    st_vid_frames    = gr.State([])
+    st_vid_path      = gr.State(None)
+    st_vid_h         = gr.State(0)
+    st_vid_w         = gr.State(0)
+    st_out_fps       = gr.State(5.0)
+    st_vid_obj_masks = gr.State([])
+    st_prompt_hist   = gr.State([])
+    st_pcs_masks     = gr.State([])
+    st_pending_pts   = gr.State([])
+    st_last_file     = gr.State(None)
 
     with gr.Tabs(selected=1):
 
-        # ══════════════════════════════════════════════════════════════════
-        # TAB 1 — Image Segmentation (self-contained)
-        # ══════════════════════════════════════════════════════════════════
         with gr.Tab("Image Segmentation", id=0):
             with gr.Row():
                 with gr.Column(scale=1):
                     t1_img    = gr.Image(label="Upload Image", type="pil", height=350)
                     t1_prompt = gr.Textbox(label="Text Prompt", value=DEFAULT_PROMPT)
                     with gr.Accordion("Advanced", open=False):
-                        t1_conf = gr.Slider(0.0, 1.0, value=0.45, step=0.05,
-                                            label="Confidence Threshold")
+                        t1_conf = gr.Slider(0.0, 1.0, value=0.45, step=0.05, label="Confidence Threshold")
                     t1_btn = gr.Button("Segment Image", variant="primary")
                 with gr.Column(scale=2):
-                    t1_result = gr.AnnotatedImage(
-                        label="Segmented Result (per-instance colours)", height=430)
-            t1_btn.click(fn=run_image_segmentation,
-                         inputs=[t1_img, t1_prompt, t1_conf], outputs=[t1_result])
+                    t1_result = gr.AnnotatedImage(label="Segmented Result (per-instance colours)", height=430)
+            t1_btn.click(fn=run_image_segmentation, inputs=[t1_img, t1_prompt, t1_conf], outputs=[t1_result])
 
-        # ══════════════════════════════════════════════════════════════════
-        # TAB 2 — Mask Editor  (image mode OR video session mode)
-        # ══════════════════════════════════════════════════════════════════
         with gr.Tab("Mask Editor", id=1):
             gr.Markdown(f"""
 **Image mode:** Load image → Auto Detect (PCS) → click to add/erase regions (PVS) → Save.
 
 **Video mode:** Load video → Auto Detect (PCS) → click to refine per-object → Propagate (Tab 3).
 - PCS detects **all bamboo instances simultaneously** as separate tracked objects.
-- Click in **Add mode** adds a new missed object. Click in **Refine mode** refines the nearest existing object.
-- **Ctrl+Z** = Undo (up to {MAX_VID_HIST} steps via session replay).
-- **Reset to PCS** wipes all manual refinements.
+- Click in **Add mode** to add missed objects, **Erase mode** to remove false positives.
+- **Ctrl+Z** = Undo (up to {MAX_VID_HIST} steps). **Reset to PCS** wipes all manual refinements.
 """)
             gr.HTML(CTRLZ_JS)
 
-            # ── file loader ───────────────────────────────────────────────
             with gr.Row():
                 me_folder  = gr.Textbox(label="Input Folder", value=_startup_input_dir, scale=4)
                 me_refresh = gr.Button("🔄 Refresh", scale=0, min_width=90)
-            me_file_dd     = gr.Dropdown(label="Select File",
-                                            choices=list_folder_media(_startup_input_dir),
-                                            value=_load_config().get("last_file", None),
-                                            interactive=True, allow_custom_value=True)
+            me_file_dd  = gr.Dropdown(label="Select File",
+                                       choices=list_folder_media(_startup_input_dir),
+                                       value=_load_config().get("last_file", None),
+                                       interactive=True, allow_custom_value=True)
             me_load_btn    = gr.Button("Load Selected File", variant="secondary")
             me_load_status = gr.Textbox(label="Load Status", interactive=False, lines=1)
             def _on_input_dir_change(v):
@@ -1376,43 +1162,35 @@ with gr.Blocks() as demo:
             gr.Markdown("---")
 
             with gr.Row():
-                # ── left controls ─────────────────────────────────────────
                 with gr.Column(scale=1):
                     me_loaded_preview = gr.Image(type="pil", label="Loaded Frame / Image",
                                                  height=280, interactive=False)
                     me_prompt = gr.Textbox(label="Prompt", value=DEFAULT_PROMPT)
-                    me_conf   = gr.Slider(0.0, 1.0, value=0.45, step=0.05,
-                                          label="Confidence Threshold")
+                    me_conf   = gr.Slider(0.0, 1.0, value=0.45, step=0.05, label="Confidence Threshold")
                     me_mode   = gr.Radio(["add", "erase"], value="add",
                                          label="Click Mode  (add=new object / erase=remove object)")
-
                     with gr.Row():
                         me_btn_auto  = gr.Button("🔍 Auto Detect (PCS)", variant="primary")
                         me_btn_reset = gr.Button("Reset to PCS", variant="secondary")
                     with gr.Row():
-                        me_btn_undo   = gr.Button("↩ Undo (Ctrl+Z)", elem_id="me_undo_btn")
-                        me_btn_clrpt  = gr.Button("Clear Markers")
+                        me_btn_undo  = gr.Button("↩ Undo (Ctrl+Z)", elem_id="me_undo_btn")
+                        me_btn_clrpt = gr.Button("Clear Markers")
                     me_btn_submit = gr.Button("✅ Submit Points", variant="primary",
                                               visible=False, elem_id="me_submit_btn")
                     me_btn_pop    = gr.Button("⌫ Pop Last Point", variant="secondary",
                                               visible=False, elem_id="me_pop_btn")
-
                     gr.Markdown("**Save / Propagate**")
                     me_btn_save = gr.Button("💾 Save Frame Mask", variant="primary")
                     me_status   = gr.Textbox(label="Status", interactive=False, lines=3)
 
-                # ── right outputs ──────────────────────────────────────────
                 with gr.Column(scale=6):
-                    me_colored = gr.Image(type="pil",
-                                          label="PCS Result — multi-colour per instance",
-                                          height=280, interactive=False)
-                    me_pvs_overlay = gr.Image(type="pil",
-                                              label="Session Overlay — click to refine",
+                    me_colored     = gr.Image(type="pil", label="PCS Result — multi-colour per instance",
+                                              height=280, interactive=False)
+                    me_pvs_overlay = gr.Image(type="pil", label="Session Overlay — click to refine",
                                               height=360, interactive=True)
-                    me_mask_bw = gr.Image(type="pil", label="Binary Mask Preview",
-                                          height=200, interactive=False)
+                    me_mask_bw     = gr.Image(type="pil", label="Binary Mask Preview",
+                                              height=200, interactive=False)
 
-            # ── image-mode specific state ─────────────────────────────────
             st_me_img   = gr.State(None)
             st_me_auto  = gr.State(None)
             st_me_mask  = gr.State(None)
@@ -1422,45 +1200,30 @@ with gr.Blocks() as demo:
             st_me_modes = gr.State([])
             st_is_video = gr.State(False)
 
-            # pre-declare Tab 3 components for forward-reference
             vp_keyframe_preview = gr.Image(type="pil", visible=False,
-                                           label="Frame 0 Detection Preview",
-                                           height=200, interactive=False)
-            vp_target_fps = gr.Slider(0, 30, value=5, step=1, visible=False,
-                                      label="Target FPS (0 = source FPS)")
-            vp_framelim   = gr.Slider(0, 2000, value=0, step=10, visible=False,
-                                      label="Frame Limit (0 = all frames)")
+                                           label="Frame 0 Detection Preview", height=200, interactive=False)
+            vp_target_fps = gr.Slider(0, 30, value=5, step=1, visible=False, label="Target FPS (0 = source FPS)")
+            vp_framelim   = gr.Slider(0, 2000, value=0, step=10, visible=False, label="Frame Limit (0 = all frames)")
 
-            # ── refresh ───────────────────────────────────────────────────
             def _refresh(folder, last_file):
                 folder = _norm_path(folder or "")
-                if folder:
-                    _save_config("input_dir", folder)
+                if folder: _save_config("input_dir", folder)
                 files = list_folder_media(folder)
                 if not files:
                     return gr.update(choices=[], value=None), "⚠️ No files found."
                 value = last_file if last_file in files else files[0]
                 return gr.update(choices=files, value=value), f"Found {len(files)} file(s)."
+            me_refresh.click(fn=_refresh, inputs=[me_folder, st_last_file], outputs=[me_file_dd, me_load_status])
 
-            me_refresh.click(fn=_refresh, inputs=[me_folder, st_last_file],
-                             outputs=[me_file_dd, me_load_status])
-
-            # ── load file ─────────────────────────────────────────────────
             def _load(folder, filename, out_dir):
                 folder  = _norm_path(folder or "")
                 out_dir = _norm_path(out_dir or "")
                 pil, is_vid, full_path, status, native_fps = load_media_file(folder, filename)
-                tab3_vis = gr.update(visible=is_vid)
-                fps_update = gr.update(maximum=int(native_fps),
-                                       value=min(5, int(native_fps)),
+                tab3_vis   = gr.update(visible=is_vid)
+                fps_update = gr.update(maximum=int(native_fps), value=min(5, int(native_fps)),
                                        label=f"Target FPS (0 = keep source {native_fps:.1f}fps)"
                                        ) if is_vid else gr.update()
-
-                # check for existing saved mask
-                existing_mask = None
-                existing_colored = None
-                existing_pvs_ov  = None
-                existing_bw      = None
+                existing_mask = existing_colored = existing_pvs_ov = existing_bw = None
                 if full_path and out_dir and out_dir.strip() and pil is not None:
                     stem  = Path(full_path).stem
                     fname = "mask_frame000000.png" if is_vid else "mask.png"
@@ -1468,12 +1231,10 @@ with gr.Blocks() as demo:
                     if mask_path.exists():
                         try:
                             m = np.array(Image.open(mask_path).convert("L"))
-                            existing_mask   = (m > 0).astype(np.uint8)
-                            fname_stem      = mask_path.stem
-                            ovl_path        = mask_path.parent / f"{fname_stem}_overlay.png"
+                            existing_mask = (m > 0).astype(np.uint8)
+                            ovl_path = mask_path.parent / f"{mask_path.stem}_overlay.png"
                             if ovl_path.exists():
-                                existing_colored = Image.open(ovl_path).convert("RGB")
-                                existing_pvs_ov  = existing_colored
+                                existing_colored = existing_pvs_ov = Image.open(ovl_path).convert("RGB")
                             else:
                                 existing_colored = apply_mask_overlay(pil, existing_mask, opacity=0.55)
                                 existing_pvs_ov  = apply_mask_overlay(pil, existing_mask, opacity=0.5)
@@ -1481,109 +1242,61 @@ with gr.Blocks() as demo:
                             status += f"  ✅ Existing mask loaded."
                         except Exception as e:
                             status += f"  ⚠️ Mask load failed: {e}"
-
-                return (
-                    pil, pil, is_vid, full_path, status,
-                    tab3_vis,
-                    existing_mask, existing_mask, existing_mask,
-                    [], [], [],
-                    existing_colored, existing_pvs_ov, existing_bw,
-                    existing_bw,
-                    filename, fps_update,
-                )
+                return (pil, pil, is_vid, full_path, status, tab3_vis,
+                        existing_mask, existing_mask, existing_mask,
+                        [], [], [],
+                        existing_colored, existing_pvs_ov, existing_bw,
+                        existing_bw, filename, fps_update)
 
             me_load_btn.click(
-                fn=_load,
-                inputs=[me_folder, me_file_dd, st_out_dir],
+                fn=_load, inputs=[me_folder, me_file_dd, st_out_dir],
                 outputs=[
-                    me_loaded_preview, st_me_img, st_is_video, st_vid_path,
-                    me_load_status,
+                    me_loaded_preview, st_me_img, st_is_video, st_vid_path, me_load_status,
                     tab_video_prop := gr.Tab("Video Propagator", visible=False),
                     st_me_auto, st_me_mask, st_shared_mask := gr.State(None),
                     st_me_hist, st_me_pts, st_me_modes,
                     me_colored, me_pvs_overlay, me_mask_bw,
-                    vp_keyframe_preview,
-                    st_last_file, vp_target_fps,
+                    vp_keyframe_preview, st_last_file, vp_target_fps,
                 ],
             )
-            # save last loaded filename for next startup
-            me_load_btn.click(fn=lambda f: _save_config("last_file", f),
-                              inputs=[me_file_dd], outputs=[])
+            me_load_btn.click(fn=lambda f: _save_config("last_file", f), inputs=[me_file_dd], outputs=[])
 
-            # ── Auto Detect (PCS) ─────────────────────────────────────────
-            def _auto_detect(img, is_vid, vid_path, prompt, conf,
-                             target_fps, frame_lim,
-                             # image-mode state
-                             hist, pts, modes):
+            def _auto_detect(img, is_vid, vid_path, prompt, conf, target_fps, frame_lim, hist, pts, modes):
                 if is_vid:
-                    # ── VIDEO MODE: start native SAM3 session ─────────────
                     if VID_PREDICTOR is None:
-                        return (None, None, None,
-                                None, [], [], None, [], 0.0, 0, 0,
-                                [], None,
-                                "❌ VID_PREDICTOR not loaded.", None, None)
+                        return (None, None, None, None, [], [], None, [], 0.0, 0, 0, [], None,
+                                "❌ VID_PREDICTOR not loaded.", None, None, [], [])
                     session_id, temp_dir, frames, overlay, obj_masks_out, n_obj, status, out_fps, vid_h, vid_w = \
                         vid_start_session(vid_path, prompt, conf, float(target_fps), int(frame_lim))
-
                     binary = (_build_label_map(obj_masks_out, (vid_h, vid_w)) > 0).astype(np.uint8) if obj_masks_out else None
-
-                    return (
-                        overlay,                # me_colored
-                        overlay,                # me_pvs_overlay
-                        _bw_preview(binary),    # me_mask_bw
-                        session_id,             # st_session_id
-                        frames,                 # st_vid_frames
-                        temp_dir,               # st_temp_dir
-                        binary,                 # st_shared_mask (binary for display)
-                        obj_masks_out,          # st_vid_obj_masks
-                        out_fps,                # st_out_fps
-                        vid_h,                  # st_vid_h
-                        vid_w,                  # st_vid_w
-                        [],                     # st_prompt_hist (reset)
-                        overlay,                # vp_keyframe_preview
-                        status,                 # me_status
-                        None,                   # st_me_mask (N/A in video mode)
-                        None,                   # st_me_inst
-                        obj_masks_out,          # st_pcs_masks (undo baseline)
-                        [],                     # st_pending_pts (reset)
-                    )
+                    return (overlay, overlay, _bw_preview(binary),
+                            session_id, frames, temp_dir, binary, obj_masks_out,
+                            out_fps, vid_h, vid_w, [], overlay, status,
+                            None, None, obj_masks_out, [])
                 else:
-                    # ── IMAGE MODE: transformers PCS ──────────────────────
                     if img is None:
                         return (None, None, None, None, [], None, None, [], 0.0, 0, 0, [], None,
-                                "⚠️ No image loaded — load a file first.", None, None)
+                                "⚠️ No image loaded — load a file first.", None, None, [], [])
                     pil, colored, binary, inst_masks = run_pcs_dual(img, prompt, conf)
                     pvs_src = inst_masks if inst_masks is not None else binary
                     pvs_ov  = apply_mask_overlay(pil, pvs_src, opacity=0.5)
                     status  = f"✅ PCS done. {0 if inst_masks is None else len(inst_masks)} instances."
-                    return (
-                        colored, pvs_ov, _bw_preview(binary),
-                        None, [], None, binary, [], 0.0, 0, 0,
-                        [],
-                        None,
-                        status,
-                        binary, inst_masks,
-                    )
+                    return (colored, pvs_ov, _bw_preview(binary),
+                            None, [], None, binary, [], 0.0, 0, 0,
+                            [], None, status, binary, inst_masks, [], [])
 
             me_btn_auto.click(
                 fn=_auto_detect,
                 inputs=[st_me_img, st_is_video, st_vid_path, me_prompt, me_conf,
-                        vp_target_fps, vp_framelim,
-                        st_me_hist, st_me_pts, st_me_modes],
-                outputs=[
-                    me_colored, me_pvs_overlay, me_mask_bw,
-                    st_session_id, st_vid_frames, st_temp_dir,
-                    st_shared_mask, st_vid_obj_masks,
-                    st_out_fps, st_vid_h, st_vid_w,
-                    st_prompt_hist,
-                    vp_keyframe_preview,
-                    me_status,
-                    st_me_mask, st_me_inst,
-                    st_pcs_masks, st_pending_pts,
-                ],
+                        vp_target_fps, vp_framelim, st_me_hist, st_me_pts, st_me_modes],
+                outputs=[me_colored, me_pvs_overlay, me_mask_bw,
+                         st_session_id, st_vid_frames, st_temp_dir,
+                         st_shared_mask, st_vid_obj_masks,
+                         st_out_fps, st_vid_h, st_vid_w,
+                         st_prompt_hist, vp_keyframe_preview, me_status,
+                         st_me_mask, st_me_inst, st_pcs_masks, st_pending_pts],
             )
 
-            # ── Click handler (PVS) ───────────────────────────────────────
             def _click(img, is_vid, session_id, frames, vid_h, vid_w,
                        mask, mode, hist, pts, modes,
                        prompt_hist, prompt, prev_obj_masks, pending_pts,
@@ -1592,7 +1305,6 @@ with gr.Blocks() as demo:
                 mode = mode or "add"
 
                 if is_vid and session_id:
-                    # ── VIDEO MODE ────────────────────────────────────────
                     frame0_pil = Image.fromarray(frames[0])
                     if mode == "erase":
                         clicked_obj_id = None
@@ -1607,7 +1319,7 @@ with gr.Blocks() as demo:
                             if pending_pts:
                                 overlay = draw_points_on_image(overlay,
                                     [[p[0], p[1]] for p in pending_pts], ["add"]*len(pending_pts))
-                            binary  = (_build_label_map(prev_obj_masks, (vid_h, vid_w)) > 0).astype(np.uint8) if prev_obj_masks else None
+                            binary = (_build_label_map(prev_obj_masks, (vid_h, vid_w)) > 0).astype(np.uint8) if prev_obj_masks else None
                             return (overlay, _bw_preview(binary), prompt_hist,
                                     pts, modes, "⚠️ Clicked background — no object to erase.",
                                     binary, prev_obj_masks or [], pending_pts,
@@ -1623,15 +1335,13 @@ with gr.Blocks() as demo:
                                 pts, modes, status, binary, merged_list, pending_pts,
                                 gr.update(visible=bool(pending_pts)),
                                 gr.update(visible=bool(pending_pts)))
-                    else:  # add -- just stage the point, don't call SAM3 yet
-                        # Ignore clicks that land inside an existing mask
+                    else:
                         yi, xi = int(y), int(x)
                         already_covered = any(
                             0 <= yi < m.shape[0] and 0 <= xi < m.shape[1] and m[yi, xi] > 0
                             for _, m in (prev_obj_masks or [])
                         )
                         if already_covered:
-                            print(f"[_click] add ignored at ({int(x)},{int(y)}) — inside existing mask")
                             overlay = _render_native_outputs(frame0_pil, prev_obj_masks or [])
                             if pending_pts:
                                 overlay = draw_points_on_image(overlay,
@@ -1649,35 +1359,29 @@ with gr.Blocks() as demo:
                         overlay = draw_points_on_image(overlay,
                             [[p[0], p[1]] for p in new_pending], ["add"]*len(new_pending))
                         binary  = (_build_label_map(prev_obj_masks, (vid_h, vid_w)) > 0).astype(np.uint8) if prev_obj_masks else None
-                        status  = f"🟢 {len(new_pending)} point(s) staged -- click Submit Points to register"
+                        status  = f"🟢 {len(new_pending)} point(s) staged — click Submit Points to register"
                         return (overlay, _bw_preview(binary), prompt_hist,
                                 pts, modes, status, binary, prev_obj_masks or [], new_pending,
-                                gr.update(visible=True),
-                                gr.update(visible=True))
+                                gr.update(visible=True), gr.update(visible=True))
                 else:
-                    # ── IMAGE MODE ────────────────────────────────────────
                     ov, new_mask, hist, pts, modes, status = \
                         mask_editor_click_image(evt, img, mask, mode, hist, pts, modes)
                     return (ov, _bw_preview(new_mask), hist,
                             pts, modes, status, new_mask, [], [],
-                            gr.update(visible=False),
-                            gr.update(visible=False))
+                            gr.update(visible=False), gr.update(visible=False))
 
             me_pvs_overlay.select(
                 fn=_click,
                 inputs=[st_me_img, st_is_video, st_session_id, st_vid_frames,
-                        st_vid_h, st_vid_w,
-                        st_me_mask, me_mode, st_me_hist, st_me_pts, st_me_modes,
-                        st_prompt_hist, me_prompt, st_vid_obj_masks, st_pending_pts],
-                outputs=[me_pvs_overlay, me_mask_bw,
-                         st_prompt_hist, st_me_pts, st_me_modes,
+                        st_vid_h, st_vid_w, st_me_mask, me_mode, st_me_hist,
+                        st_me_pts, st_me_modes, st_prompt_hist, me_prompt,
+                        st_vid_obj_masks, st_pending_pts],
+                outputs=[me_pvs_overlay, me_mask_bw, st_prompt_hist, st_me_pts, st_me_modes,
                          me_status, st_me_mask, st_vid_obj_masks, st_pending_pts,
                          me_btn_submit, me_btn_pop],
             )
 
-            # -- Submit staged points (batch add) ----------------------------
-            def _submit_batch(session_id, frames, vid_h, vid_w,
-                              prev_obj_masks, pending_pts, prompt_hist):
+            def _submit_batch(session_id, frames, vid_h, vid_w, prev_obj_masks, pending_pts, prompt_hist):
                 if not session_id or not pending_pts:
                     frame0_pil = Image.fromarray(frames[0]) if frames else None
                     overlay = _render_native_outputs(frame0_pil, prev_obj_masks or []) if frame0_pil else None
@@ -1688,15 +1392,11 @@ with gr.Blocks() as demo:
                 frame0_pil = Image.fromarray(frames[0])
                 merged = {oid: m for oid, m in (prev_obj_masks or [])}
                 batch_reqs = []
-                # Assign obj_ids ourselves: start above the current max PCS id
-                # so each click is guaranteed a unique id and doesn't collide.
                 base_id = max((oid for oid, _ in (prev_obj_masks or [])), default=998) + 1
-                if base_id < 1000:
-                    base_id = 1000
+                if base_id < 1000: base_id = 1000
                 for i, (x, y) in enumerate(pending_pts):
                     obj_id = base_id + i
-                    _, new_masks, _ = vid_add_point(
-                        session_id, frames, vid_h, vid_w, int(x), int(y), 1, obj_id)
+                    _, new_masks, _ = vid_add_point(session_id, frames, vid_h, vid_w, int(x), int(y), 1, obj_id)
                     for oid, m in new_masks:
                         merged[oid] = m
                     batch_reqs.append(dict(type="add_prompt", frame_index=0,
@@ -1706,8 +1406,7 @@ with gr.Blocks() as demo:
                 binary  = (_build_label_map(merged_list, (vid_h, vid_w)) > 0).astype(np.uint8) if merged_list else None
                 overlay = _render_native_outputs(frame0_pil, merged_list)
                 new_hist = (list(prompt_hist) + [{"reqs": batch_reqs, "masks": merged_list}])[-MAX_VID_HIST:]
-                status  = f"✅ {len(pending_pts)} point(s) submitted -- will be tracked in Propagate"
-                print(f"[_submit_batch] {status}")
+                status  = f"✅ {len(pending_pts)} point(s) submitted — will be tracked in Propagate"
                 return (overlay, _bw_preview(binary), new_hist,
                         status, binary, merged_list, [],
                         gr.update(visible=False), gr.update(visible=False))
@@ -1721,7 +1420,6 @@ with gr.Blocks() as demo:
                          me_btn_submit, me_btn_pop],
             )
 
-            # ── Pop last staged point ──────────────────────────────────────
             def _pop_point(frames, vid_h, vid_w, prev_obj_masks, pending_pts):
                 if not pending_pts:
                     frame0_pil = Image.fromarray(frames[0]) if frames else None
@@ -1750,19 +1448,15 @@ with gr.Blocks() as demo:
                          me_btn_submit, me_btn_pop],
             )
 
-            # ── Undo ──────────────────────────────────────────────────────
             def _undo(is_vid, session_id, frames, vid_h, vid_w,
-                      prompt, prompt_hist, pcs_masks,
-                      img, mask, hist):
+                      prompt, prompt_hist, pcs_masks, img, mask, hist):
                 if is_vid and session_id:
                     if not prompt_hist:
-                        # nothing to undo -- restore to PCS baseline
                         overlay = _render_native_outputs(Image.fromarray(frames[0]), pcs_masks or [])
                         binary  = (_build_label_map(pcs_masks, (vid_h, vid_w)) > 0).astype(np.uint8) if pcs_masks else None
                         vid_reset_to_pcs(session_id, frames, vid_h, vid_w, prompt)
                         return overlay, _bw_preview(binary), [], [], [], "↩️ Nothing to undo — restored to PCS.", binary, pcs_masks or [], gr.update(visible=False), gr.update(visible=False)
                     new_hist = prompt_hist[:-1]
-                    # Replay session: reset + PCS + all remaining entries
                     try:
                         VID_PREDICTOR.handle_request(dict(type="reset_session", session_id=session_id))
                         VID_PREDICTOR.handle_request(dict(
@@ -1776,11 +1470,9 @@ with gr.Blocks() as demo:
                                 VID_PREDICTOR.handle_request(r)
                     except Exception as e:
                         import traceback; traceback.print_exc()
-                    # Display: use stored masks from previous entry, or PCS if now empty
-                    if new_hist:
-                        display_masks = new_hist[-1].get("masks", pcs_masks or []) if isinstance(new_hist[-1], dict) else (pcs_masks or [])
-                    else:
-                        display_masks = pcs_masks or []
+                    display_masks = (new_hist[-1].get("masks", pcs_masks or [])
+                                     if new_hist and isinstance(new_hist[-1], dict)
+                                     else (pcs_masks or []))
                     overlay = _render_native_outputs(Image.fromarray(frames[0]), display_masks)
                     binary  = (_build_label_map(display_masks, (vid_h, vid_w)) > 0).astype(np.uint8) if display_masks else None
                     status  = f"↩️ Undo — {len(new_hist)} action(s) remaining"
@@ -1794,26 +1486,20 @@ with gr.Blocks() as demo:
                     prev_mask, prev_pts, prev_modes = hist.pop()
                     ov = apply_mask_overlay(img, prev_mask, opacity=0.5)
                     ov = draw_points_on_image(ov, prev_pts, prev_modes)
-                    return (ov, _bw_preview(prev_mask), hist,
-                            prev_pts, prev_modes,
+                    return (ov, _bw_preview(prev_mask), hist, prev_pts, prev_modes,
                             f"↩️ Undo — {len(hist)} step(s) remaining.", prev_mask, [], gr.update(), gr.update())
 
             me_btn_undo.click(
                 fn=_undo,
                 inputs=[st_is_video, st_session_id, st_vid_frames, st_vid_h, st_vid_w,
-                        me_prompt, st_prompt_hist, st_pcs_masks,
-                        st_me_img, st_me_mask, st_me_hist],
-                outputs=[me_pvs_overlay, me_mask_bw,
-                         st_prompt_hist, st_me_pts, st_me_modes,
+                        me_prompt, st_prompt_hist, st_pcs_masks, st_me_img, st_me_mask, st_me_hist],
+                outputs=[me_pvs_overlay, me_mask_bw, st_prompt_hist, st_me_pts, st_me_modes,
                          me_status, st_me_mask, st_vid_obj_masks, me_btn_submit, me_btn_pop],
             )
 
-            # ── Reset to PCS ──────────────────────────────────────────────
-            def _reset(is_vid, session_id, frames, vid_h, vid_w, prompt,
-                       img, auto_mask):
+            def _reset(is_vid, session_id, frames, vid_h, vid_w, prompt, img, auto_mask):
                 if is_vid and session_id:
-                    overlay, obj_masks, status = vid_reset_to_pcs(
-                        session_id, frames, vid_h, vid_w, prompt)
+                    overlay, obj_masks, status = vid_reset_to_pcs(session_id, frames, vid_h, vid_w, prompt)
                     binary = (_build_label_map(obj_masks, (vid_h, vid_w)) > 0).astype(np.uint8) if obj_masks else None
                     return overlay, _bw_preview(binary), [], [], [], status, binary, obj_masks
                 else:
@@ -1826,47 +1512,34 @@ with gr.Blocks() as demo:
                 fn=_reset,
                 inputs=[st_is_video, st_session_id, st_vid_frames, st_vid_h, st_vid_w,
                         me_prompt, st_me_img, st_me_auto],
-                outputs=[me_pvs_overlay, me_mask_bw,
-                         st_prompt_hist, st_me_pts, st_me_modes,
+                outputs=[me_pvs_overlay, me_mask_bw, st_prompt_hist, st_me_pts, st_me_modes,
                          me_status, st_me_mask, st_vid_obj_masks],
             )
 
-            # ── Clear markers (image mode only) ───────────────────────────
             def _clrpt(img, mask):
                 if img is None or mask is None:
                     return None, mask, [], [], "Nothing to clear."
                 ov = apply_mask_overlay(img, mask, opacity=0.5)
                 return ov, mask, [], [], "🧹 Markers cleared."
+            me_btn_clrpt.click(fn=_clrpt, inputs=[st_me_img, st_me_mask],
+                               outputs=[me_pvs_overlay, st_me_mask, st_me_pts, st_me_modes, me_status])
 
-            me_btn_clrpt.click(
-                fn=_clrpt, inputs=[st_me_img, st_me_mask],
-                outputs=[me_pvs_overlay, st_me_mask, st_me_pts, st_me_modes, me_status],
-            )
-
-            # ── Save frame mask ───────────────────────────────────────────
-            def _save(is_vid, mask, inst_masks, obj_masks,
-                      pil_img, vid_frames, vid_h, vid_w,
+            def _save(is_vid, mask, inst_masks, obj_masks, pil_img, vid_frames, vid_h, vid_w,
                       src_path, out_dir, prompt, conf, pts, modes, min_px):
                 if is_vid and obj_masks:
-                    # build mask from native obj_masks
-                    label_map = _build_label_map(obj_masks, (vid_h, vid_w))
-                    binary    = (label_map > 0).astype(np.uint8)
+                    label_map  = _build_label_map(obj_masks, (vid_h, vid_w))
+                    binary     = (label_map > 0).astype(np.uint8)
                     frame0_pil = Image.fromarray(vid_frames[0]) if vid_frames else pil_img
-                    status = save_mask_with_meta(
-                        binary, obj_masks, frame0_pil, src_path, out_dir,
-                        prompt, conf, [], [],
-                        is_keyframe=True, frame_idx=0,
-                    )
+                    status = save_mask_with_meta(binary, obj_masks, frame0_pil, src_path, out_dir,
+                                                 prompt, conf, [], [], is_keyframe=True, frame_idx=0)
                     return binary, status
                 elif not is_vid and mask is not None:
-                    clean  = remove_small_regions(mask, int(min_px))
+                    clean = remove_small_regions(mask, int(min_px))
                     is_video_path = src_path is not None and Path(src_path).suffix.lower() in VID_EXTS
-                    status = save_mask_with_meta(
-                        clean, inst_masks, pil_img, src_path, out_dir,
-                        prompt, conf, pts, modes,
-                        is_keyframe=is_video_path,
-                        frame_idx=0 if is_video_path else None,
-                    )
+                    status = save_mask_with_meta(clean, inst_masks, pil_img, src_path, out_dir,
+                                                 prompt, conf, pts, modes,
+                                                 is_keyframe=is_video_path,
+                                                 frame_idx=0 if is_video_path else None)
                     return clean, status
                 return mask, "⚠️ Nothing to save."
 
@@ -1874,14 +1547,11 @@ with gr.Blocks() as demo:
                 fn=_save,
                 inputs=[st_is_video, st_me_mask, st_me_inst, st_vid_obj_masks,
                         st_me_img, st_vid_frames, st_vid_h, st_vid_w,
-                        st_vid_path, st_out_dir,
-                        me_prompt, me_conf, st_me_pts, st_me_modes, shared_min_px],
+                        st_vid_path, st_out_dir, me_prompt, me_conf,
+                        st_me_pts, st_me_modes, shared_min_px],
                 outputs=[st_shared_mask, me_status],
             )
 
-        # ══════════════════════════════════════════════════════════════════
-        # TAB 3 — Video Propagator
-        # ══════════════════════════════════════════════════════════════════
         with tab_video_prop:
             gr.Markdown("""
 Propagates **all detected objects** from Tab 2's active session across all video frames.
@@ -1908,8 +1578,7 @@ Propagates **all detected objects** from Tab 2's active session across all video
 
             vp_target_fps.release(fn=lambda v: v, inputs=[vp_target_fps], outputs=[gr.State()])
 
-            def _propagate(session_id, frames, temp_dir, vid_path,
-                           out_dir, out_fps, min_px,
+            def _propagate(session_id, frames, temp_dir, vid_path, out_dir, out_fps, min_px,
                            prompt, prompt_history, target_fps, frame_limit):
                 vid_display = vid_path or "(none loaded)"
                 if not session_id:
@@ -1917,12 +1586,10 @@ Propagates **all detected objects** from Tab 2's active session across all video
                     return
                 yield vid_display, None, None, "⏳ Starting propagation …"
                 for mp4, log in run_video_propagation(
-                    session_id, frames, temp_dir, vid_path,
-                    out_dir, float(out_fps), int(min_px),
-                    prompt=prompt,
+                    session_id, frames, temp_dir, vid_path, out_dir,
+                    float(out_fps), int(min_px), prompt=prompt,
                     prompt_history=prompt_history,
-                    target_fps=float(target_fps),
-                    frame_limit=int(frame_limit),
+                    target_fps=float(target_fps), frame_limit=int(frame_limit),
                 ):
                     yield vid_display, None, mp4, log
 
@@ -1934,7 +1601,6 @@ Propagates **all detected objects** from Tab 2's active session across all video
                 outputs=[vp_video_info, vp_keyframe_preview, vp_video_out, vp_log],
             )
 
-# ── launch ────────────────────────────────────────────────────────────────────
 demo.queue(default_concurrency_limit=2, max_size=4)
 
 if __name__ == "__main__":
