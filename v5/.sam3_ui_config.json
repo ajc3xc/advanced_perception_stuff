@@ -3,5 +3,6 @@
   "input_dir": "C:/Users/13144/Documents/PhD/Robotics_ABE6399/inputs/videos_left_preprocess",
   "output_dir": "C:/Users/13144/Documents/PhD/Robotics_ABE6399/outputs/video",
   "min_px": 760,
-  "target_fps": 1
+  "target_fps": 1,
+  "frame_limit": 50
 }

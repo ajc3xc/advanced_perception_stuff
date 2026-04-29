@@ -800,9 +800,9 @@ def vid_start_session(video_path_str: str, prompt: str, conf: float,
 def vid_expand_session_for_propagation(
     session_id: str, temp_dir: str, video_path_str: str,
     target_fps: float, frame_limit: int, prompt: str,
-    prompt_history: list, vid_h: int, vid_w: int,
+    prompt_history: list, vid_h: int, vid_w: int, start_frame: int = 0,
 ):
-    print(f"[vid_expand_session] START  {_mem()}")
+    print(f"[vid_expand_session] START start_frame={start_frame}  {_mem()}")
 
     try:
         VID_PREDICTOR.model.score_threshold_detection = float(
@@ -815,11 +815,16 @@ def vid_expand_session_for_propagation(
     fps     = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     step    = max(1, round(fps / target_fps)) if target_fps > 0 else 1
+    # skip to start_frame (in output-frame units, not source frames)
+    src_start = start_frame * step
     if frame_limit > 0:
-        total = min(total, frame_limit * step)
+        total = min(total, src_start + frame_limit * step)
 
     frames  = []
     raw_idx = 0
+    # seek past the frames we're skipping
+    cap.set(cv2.CAP_PROP_POS_FRAMES, src_start)
+    raw_idx = src_start
     while cap.isOpened():
         if frame_limit > 0 and len(frames) >= frame_limit:
             break
@@ -828,7 +833,9 @@ def vid_expand_session_for_propagation(
             if not ret: break
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frames.append(rgb)
-            fname = Path(temp_dir) / f"{len(frames)-1:05d}.jpg"
+            # JPG filename uses local index (0-based within this chunk)
+            local_idx = len(frames) - 1
+            fname = Path(temp_dir) / f"{local_idx:05d}.jpg"
             if not fname.exists():
                 cv2.imwrite(str(fname), frame)
         else:
@@ -1070,7 +1077,7 @@ def run_video_propagation(
     session_id: str, frames: list, temp_dir: str, video_path_str: str,
     out_root_str: str, out_fps: float, min_region_px: int,
     prompt: str = "", prompt_history: list = None,
-    target_fps: float = 5.0, frame_limit: int = 0,
+    target_fps: float = 5.0, frame_limit: int = 0, start_frame: int = 0,
 ):
     print(f"[run_video_propagation] START session={session_id} {_mem()}")
     if VID_PREDICTOR is None:
@@ -1097,8 +1104,8 @@ def run_video_propagation(
         yield None, f"⏳ Extracting frames from video …  {_mem()}"
         frames, new_session_id, expand_status = vid_expand_session_for_propagation(
             session_id=session_id, temp_dir=temp_dir, video_path_str=video_path_str,
-            target_fps=target_fps, frame_limit=frame_limit, prompt=prompt,
-            prompt_history=prompt_history, vid_h=vid_h, vid_w=vid_w,
+            target_fps=target_fps, frame_limit=frame_limit, start_frame=start_frame,
+            prompt=prompt, prompt_history=prompt_history, vid_h=vid_h, vid_w=vid_w,
         )
         session_id = new_session_id
         n = len(frames)
@@ -1108,8 +1115,8 @@ def run_video_propagation(
             return
         yield None, f"{expand_status}  Now propagating {n} frames …"
 
-    print(f"[run_video_propagation] {n} frames {vid_w}x{vid_h} out_fps={out_fps:.1f}")
-    yield None, f"⏳ Propagating {n} frames …  {_mem()}"
+    print(f"[run_video_propagation] {n} frames {vid_w}x{vid_h} out_fps={out_fps:.1f} start_frame={start_frame}")
+    yield None, f"⏳ Propagating {n} frames (starting at output frame {start_frame}) …  {_mem()}"
 
     # Free the frames list from RAM — we'll read each frame from the temp_dir JPGs instead.
     # At 1 FPS, 433 frames × 1280×720×3 = ~1.1 GB held in RAM during propagation.
@@ -1129,7 +1136,10 @@ def run_video_propagation(
         for response in VID_PREDICTOR.handle_stream_request(dict(
             type="propagate_in_video", session_id=session_id,
         )):
+            # f_idx is local (0-based within this chunk)
+            # global_idx is the actual output frame number on disk
             f_idx     = response.get("frame_index", 0)
+            global_idx = f_idx + start_frame
             raw_out   = response.get("outputs", {})
 
             # Per-frame try/except — a dtype mismatch or OOM on one frame
@@ -1141,24 +1151,23 @@ def run_video_propagation(
                 obj_masks = []
 
             if f_idx % 5 == 0:
-                msg = f"⏳ Frame {f_idx}/{n}  {len(obj_masks)} objects  {_mem()}"
+                msg = f"⏳ Frame {global_idx}/{n + start_frame}  {len(obj_masks)} objects  {_mem()}"
                 print(f"[run_video_propagation] {msg}")
                 yield None, "\n".join(reversed(log_lines[-20:])) + "\n" + msg
 
             # Periodic VRAM cache flush to prevent fragmentation creep
             if f_idx > 0 and f_idx % 10 == 0:
                 torch.cuda.empty_cache()
-                print(f"[run_video_propagation] empty_cache @ frame {f_idx}  {_mem()}")
+                print(f"[run_video_propagation] empty_cache @ frame {global_idx}  {_mem()}")
 
             try:
-                # Read frame from disk (JPG in temp_dir) to avoid holding 433 frames in RAM
+                # Read frame from disk using LOCAL index (chunk-relative)
                 jpg_path = Path(temp_dir) / f"{f_idx:05d}.jpg"
                 if jpg_path.exists():
                     orig = Image.open(jpg_path).convert("RGB")
-                    print(f"[run_video_propagation] frame {f_idx} read from disk") if f_idx == 0 else None
+                    if f_idx == 0: print(f"[run_video_propagation] frame {global_idx} read from disk")
                 else:
-                    # Fallback: if JPG missing, write a blank frame and warn
-                    print(f"[run_video_propagation] ⚠️  frame {f_idx} JPG missing at {jpg_path}")
+                    print(f"[run_video_propagation] ⚠️  frame {global_idx} JPG missing at {jpg_path}")
                     orig = Image.new("RGB", (vid_w, vid_h), (0, 0, 0))
 
                 if obj_masks:
@@ -1171,20 +1180,21 @@ def run_video_propagation(
                     label_map     = np.zeros((vid_h, vid_w), dtype=np.uint8)
                     overlay_frame = orig
 
-                fn = f"{f_idx:06d}"
+                # Save using GLOBAL index so chunks tile correctly on disk
+                fn = f"{global_idx:06d}"
                 Image.fromarray(label_map).save(mask_dir / f"{fn}.png")
                 np.save(mask_dir / f"{fn}.npy", label_map)
                 Image.fromarray(np.array(overlay_frame)).save(ovl_dir / f"{fn}.png")
                 (meta_dir / f"{fn}.json").write_text(json.dumps({
-                    "frame_idx": f_idx, "n_objects": len(obj_masks),
+                    "frame_idx": global_idx, "n_objects": len(obj_masks),
                     "obj_ids": [int(oid) for oid, _ in obj_masks],
                     "shape_hw": [vid_h, vid_w], "timestamp": datetime.now().isoformat(),
                 }, indent=2))
                 writer.write(cv2.cvtColor(np.array(overlay_frame), cv2.COLOR_RGB2BGR))
-                log_lines.append(f"[{f_idx:05d}/{n}] {len(obj_masks)} obj")
+                log_lines.append(f"[{global_idx:06d}/{n + start_frame}] {len(obj_masks)} obj")
             except Exception as _frame_e:
-                print(f"[run_video_propagation] ⚠️  frame {f_idx} save failed: {_frame_e}")
-                log_lines.append(f"[{f_idx:05d}/{n}] ❌ {_frame_e}")
+                print(f"[run_video_propagation] ⚠️  frame {global_idx} save failed: {_frame_e}")
+                log_lines.append(f"[{global_idx:06d}] ❌ {_frame_e}")
 
     except Exception as e:
         writer.release()
@@ -1475,7 +1485,7 @@ with gr.Blocks() as demo:
                     session_id, temp_dir, frames, overlay, obj_masks_out, n_obj, status, out_fps, vid_h, vid_w = \
                         vid_start_session(vid_path, prompt, conf, float(target_fps), int(frame_lim))
                     binary = (_build_label_map(obj_masks_out, (vid_h, vid_w)) > 0).astype(np.uint8) if obj_masks_out else None
-                    return (overlay, overlay, _bw_preview(binary),
+                    return (overlay, overlay if obj_masks_out else None, _bw_preview(binary),
                             session_id, frames, temp_dir, binary, obj_masks_out,
                             out_fps, vid_h, vid_w, [], overlay, status,
                             None, None, obj_masks_out, [])
@@ -1784,6 +1794,8 @@ Propagates **all detected objects** from Tab 2's active session across all video
                                                    label="Frame Limit (0 = all frames)")
                     vp_target_fps_tab3 = gr.Slider(0, 30, value=_startup_target_fps, step=1,
                                                    label="Target FPS (0 = source FPS)")
+                    vp_start_frame_tab3 = gr.Slider(0, 2000, value=0, step=10,
+                                                    label="Start Frame (0 = from beginning)")
             with gr.Row():
                 vp_btn = gr.Button("🚀 Propagate Video", variant="primary")
 
@@ -1806,10 +1818,10 @@ Propagates **all detected objects** from Tab 2's active session across all video
             )
 
             def _propagate(session_id, frames, temp_dir, vid_path, out_dir, out_fps, min_px,
-                           prompt, prompt_history, target_fps, frame_limit):
+                           prompt, prompt_history, target_fps, frame_limit, start_frame):
                 vid_display = vid_path or "(none loaded)"
                 print(f"[_propagate] session_id={session_id!r} n_frames={len(frames) if frames else 0} "
-                      f"vid_path={vid_path!r} out_fps={out_fps} target_fps={target_fps}")
+                      f"vid_path={vid_path!r} out_fps={out_fps} target_fps={target_fps} start_frame={start_frame}")
                 if not session_id:
                     print("[_propagate] ❌ no session_id — aborting")
                     yield vid_display, None, None, "❌ No session. Run Auto Detect (PCS) in Tab 2."
@@ -1820,6 +1832,7 @@ Propagates **all detected objects** from Tab 2's active session across all video
                     float(out_fps), int(min_px), prompt=prompt,
                     prompt_history=prompt_history,
                     target_fps=float(target_fps), frame_limit=int(frame_limit),
+                    start_frame=int(start_frame),
                 ):
                     yield vid_display, None, mp4, log
 
@@ -1827,7 +1840,8 @@ Propagates **all detected objects** from Tab 2's active session across all video
                 fn=_propagate,
                 inputs=[st_session_id, st_vid_frames, st_temp_dir, st_vid_path,
                         st_out_dir, st_out_fps, shared_min_px,
-                        me_prompt, st_prompt_hist, vp_target_fps_tab3, vp_framelim_tab3],
+                        me_prompt, st_prompt_hist, vp_target_fps_tab3, vp_framelim_tab3,
+                        vp_start_frame_tab3],
                 outputs=[vp_video_info, vp_keyframe_preview, vp_video_out, vp_log],
             )
 
