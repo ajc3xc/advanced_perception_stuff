@@ -251,15 +251,34 @@ if _token_file.exists() and "HF_TOKEN" not in os.environ:
 #   during video propagation.
 try:
     if _TRANSFORMERS:
-        print("⏳  Loading TRK_MODEL to CPU (lazy GPU on click) …")
-        TRK_MODEL     = Sam3TrackerModel.from_pretrained(IMG_MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True)  # stays on CPU
+        print("ℹ️   TRK_MODEL deferred — will load on first click refinement use.")
+        TRK_MODEL     = None
         TRK_PROCESSOR = Sam3TrackerProcessor.from_pretrained(IMG_MODEL_REPO)
-        print(f"✅  TRK_MODEL on CPU ready.  {_mem()}")
-        print("ℹ️   IMG_MODEL deferred — will load on first image segmentation use.")
+        print(f"✅  TRK_PROCESSOR ready.  {_mem()}")
 except BaseException as e:
     import traceback
-    print(f"❌  TRK model load failed: {type(e).__name__}: {e}", flush=True)
+    print(f"❌  TRK processor load failed: {type(e).__name__}: {e}", flush=True)
     traceback.print_exc()
+
+_trk_model_loaded = False
+_trk_model_lock   = threading.Lock()
+
+def _ensure_trk_model():
+    """Lazy-load TRK_MODEL on first click refinement use."""
+    global TRK_MODEL, _trk_model_loaded
+    if _trk_model_loaded and TRK_MODEL is not None:
+        return
+    with _trk_model_lock:
+        if _trk_model_loaded and TRK_MODEL is not None:
+            return
+        try:
+            print(f"⏳  Lazy-loading TRK_MODEL …  {_mem()}")
+            TRK_MODEL = Sam3TrackerModel.from_pretrained(
+                IMG_MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+            _trk_model_loaded = True
+            print(f"✅  TRK_MODEL loaded.  {_mem()}")
+        except Exception as _le:
+            raise gr.Error(f"TRK_MODEL load failed: {_le}")
 
 _img_model_loaded = False  # tracks whether IMG_MODEL has been loaded yet
 _img_model_lock   = threading.Lock()
@@ -276,7 +295,7 @@ def _ensure_img_model():
             raise gr.Error("transformers not available — image model cannot be loaded.")
         try:
             print(f"⏳  Lazy-loading IMG_MODEL to GPU …  {_mem()}")
-            IMG_MODEL     = Sam3Model.from_pretrained(IMG_MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True).to(device)
+            IMG_MODEL     = Sam3Model.from_pretrained(IMG_MODEL_REPO, torch_dtype=torch.float16, low_cpu_mem_usage=True, device_map="auto").to(device)
             IMG_PROCESSOR = Sam3Processor.from_pretrained(IMG_MODEL_REPO)
             _img_model_loaded = True
             print(f"✅  IMG_MODEL loaded.  {_mem()}")
@@ -284,7 +303,8 @@ def _ensure_img_model():
             raise gr.Error(f"IMG_MODEL load failed: {_le}")
 
 def _trk_to_gpu():
-    """Move TRK_MODEL to GPU for inference."""
+    """Ensure TRK_MODEL is loaded and move to GPU for inference."""
+    _ensure_trk_model()
     if TRK_MODEL is not None and next(TRK_MODEL.parameters()).device.type != device:
         print(f"[trk] moving TRK_MODEL → GPU  {_mem()}")
         TRK_MODEL.to(device)
